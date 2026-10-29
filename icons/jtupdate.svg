@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <defs>
+    <radialGradient id="glow" cx="50%" cy="46%" r="52%">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.16"/>
+      <stop offset="1" stop-color="#FFFFFF" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="disc" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#101113"/>
+      <stop offset="1" stop-color="#030303"/>
+    </linearGradient>
+    <linearGradient id="arc" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#D8D8D8"/>
+      <stop offset="1" stop-color="#FFFFFF"/>
+    </linearGradient>
+  </defs>
+
+  <circle cx="128" cy="128" r="112" fill="url(#glow)"/>
+  <circle cx="128" cy="126" r="98" fill="url(#disc)" stroke="#404040" stroke-width="2"/>
+
+  <!-- clockwise upper arc -->
+  <path d="M 72.57 96.00 A 64 64 0 0 1 183.43 96.00"
+        fill="none" stroke="url(#arc)" stroke-width="14" stroke-linecap="round"/>
+  <polygon points="166.71,101.04 196.15,84.04 195.43,116.78" fill="url(#arc)"/>
+
+  <!-- clockwise lower arc -->
+  <path d="M 183.43 160.00 A 64 64 0 0 1 72.57 160.00"
+        fill="none" stroke="url(#arc)" stroke-width="14" stroke-linecap="round"/>
+  <polygon points="89.29,154.96 59.85,171.96 60.57,139.22" fill="url(#arc)"/>
+
+  <!-- completion bead -->
+  <circle cx="196" cy="150" r="6" fill="#66B366"/>
+</svg>

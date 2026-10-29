@@ -37,7 +37,13 @@ static const RepoDef g_repos[REPO_COUNT] = {
 };
 ```
 
-Checkouts live in `~/jtupdate/repos/<slug>`. If a checkout already exists as
+Checkouts live in `<base-dir>/<slug>`, where the base directory defaults to
+`~/jtupdate/repos`. Pass `--base-dir DIR` (or `--base-dir=DIR`) to point the
+updater at another location; a leading `~` is expanded. JTLab's Updater button
+passes `$HOME/jtupdate/repos` explicitly, so the location does not depend on
+the directory the bar was started from.
+
+If a checkout already exists as
 a git repository, an empty URL pulls its existing origin. Clones are staged in
 a temporary folder and moved into place only after they succeed, so an
 interrupted or failed clone never leaves a half-written checkout behind. If a
@@ -59,8 +65,9 @@ sudo make install
 ```
 
 That installs `jtupdate`, `jtupdatectl`, and `jtupdate-install` under
-`/usr/local/bin`. When `jtupdate` is run from its source tree, the
-`jtupdater` install uses that source tree instead of the cached clone, so a
+`/usr/local/bin`, plus the matching icon under
+`/usr/local/share/icons/hicolor`. When `jtupdate` is run from its source tree,
+the `jtupdater` install uses that source tree instead of the cached clone, so a
 freshly built updater never replaces itself with an older checkout.
 
 The helper can also be run by hand:

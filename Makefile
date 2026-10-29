@@ -6,6 +6,7 @@ LDLIBS = $(shell pkg-config --libs $(PKGS)) -lm -lpthread
 
 PREFIX ?= /usr/local
 BINDIR := $(PREFIX)/bin
+ICONDIR := $(PREFIX)/share/icons/hicolor
 
 WAYLAND_PROTOCOLS := $(shell pkg-config --variable=pkgdatadir wayland-protocols)
 XDG_SHELL_XML := $(WAYLAND_PROTOCOLS)/stable/xdg-shell/xdg-shell.xml
@@ -66,12 +67,24 @@ install: jtupdate jtupdatectl
 	install -Dm755 jtupdate $(DESTDIR)$(BINDIR)/jtupdate
 	install -Dm755 jtupdatectl $(DESTDIR)$(BINDIR)/jtupdatectl
 	install -Dm755 jtupdate-install.sh $(DESTDIR)$(BINDIR)/jtupdate-install
+	install -Dm644 icons/jtupdate.svg \
+		$(DESTDIR)$(ICONDIR)/scalable/apps/jtupdate.svg
+	install -Dm644 icons/jtupdate.png \
+		$(DESTDIR)$(ICONDIR)/256x256/apps/jtupdate.png
+	@if command -v gtk-update-icon-cache >/dev/null 2>&1; then \
+		gtk-update-icon-cache -f -t $(DESTDIR)$(ICONDIR) >/dev/null 2>&1 || true; \
+	fi
 	@echo "installed to $(DESTDIR)$(PREFIX)"
 
 uninstall:
 	rm -f $(DESTDIR)$(BINDIR)/jtupdate
 	rm -f $(DESTDIR)$(BINDIR)/jtupdatectl
 	rm -f $(DESTDIR)$(BINDIR)/jtupdate-install
+	rm -f $(DESTDIR)$(ICONDIR)/scalable/apps/jtupdate.svg
+	rm -f $(DESTDIR)$(ICONDIR)/256x256/apps/jtupdate.png
+	@if command -v gtk-update-icon-cache >/dev/null 2>&1; then \
+		gtk-update-icon-cache -f -t $(DESTDIR)$(ICONDIR) >/dev/null 2>&1 || true; \
+	fi
 
 preview: jtupdate
 	./jtupdate --screenshot preview.png

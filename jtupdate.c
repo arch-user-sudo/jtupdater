@@ -9,7 +9,8 @@
  *   ./jtupdatectl accent '#748382'       (change accent while running)
  *   ./jtupdatectl update                 (start an update)
  *
- * The repositories are cloned into ~/jtupdate/repos/<slug>.  Add the clone
+ * The repositories are cloned into <base-dir>/<slug>, which defaults to
+ * ~/jtupdate/repos and can be overridden with --base-dir.  Add the clone
  * URLs to the g_repos table below.  An existing git checkout can also be used
  * by setting its path; a missing URL then means "pull the existing origin".
  *
@@ -286,6 +287,45 @@ accent_cli(int *argc, char **argv)
 /*  Repositories                                                       */
 /* ------------------------------------------------------------------ */
 
+/* Parses --base-dir DIR / --base-dir=DIR, removes it from argv, and stores the
+ * value in *out (NULL when the option was not given). */
+static int
+base_dir_cli(int *argc, char **argv, const char **out)
+{
+    *out = NULL;
+    for (int i = 1; i < *argc; i++) {
+        const char *value = NULL;
+        int consumed = 0;
+
+        if (!strcmp(argv[i], "--base-dir")) {
+            if (i + 1 >= *argc) {
+                fprintf(stderr, "%s: --base-dir requires a directory\n",
+                        argv[0]);
+                return 0;
+            }
+            value = argv[i + 1];
+            consumed = 2;
+        } else if (!strncmp(argv[i], "--base-dir=", 11)) {
+            value = argv[i] + 11;
+            consumed = 1;
+        } else {
+            continue;
+        }
+
+        if (!value[0]) {
+            fprintf(stderr, "%s: --base-dir requires a directory\n", argv[0]);
+            return 0;
+        }
+
+        *out = value;
+        for (int j = i; j + consumed < *argc; j++)
+            argv[j] = argv[j + consumed];
+        *argc -= consumed;
+        i--;
+    }
+    return 1;
+}
+
 typedef struct {
     const char *name;
     const char *slug;
@@ -294,8 +334,10 @@ typedef struct {
     const char *install;
 } RepoDef;
 
-/* Each checkout lives under ~/jtupdate/repos/<slug>.  An existing git checkout
- * is pulled; changed repositories are built and installed. */
+/* Each checkout lives under <base-dir>/<slug>, where the base directory
+ * defaults to ~/jtupdate/repos and can be overridden with --base-dir.  An
+ * existing git checkout is pulled; changed repositories are built and
+ * installed. */
 static const RepoDef g_repos[REPO_COUNT] = {
     { "JTLab",       "JTLab",
       "https://github.com/arch-user-sudo/JTLab.git",       "make -j2", "make install" },
@@ -312,23 +354,59 @@ static const RepoDef g_repos[REPO_COUNT] = {
 };
 
 static char g_repo_root[PATH_MAX];
+static char g_repo_root_show[PATH_MAX];
 static char g_repo_path[REPO_COUNT][PATH_MAX];
 static char g_repo_short[REPO_COUNT][160];
 
+/* Expands a leading "~" or "~/" to $HOME.  Other forms are copied as-is. */
 static void
-repo_paths_init(void)
+expand_tilde(const char *in, char *out, size_t n)
+{
+    const char *home = getenv("HOME");
+    if (!home || !*home)
+        home = "/home/lynch";
+    if (in[0] == '~' && (in[1] == '/' || in[1] == '\0'))
+        snprintf(out, n, "%s%s", home, in + 1);
+    else
+        snprintf(out, n, "%s", in);
+}
+
+/* base_dir is the directory that directly holds the checkouts.  NULL or an
+ * empty string keeps the historical ~/jtupdate/repos location.  The bar
+ * passes this explicitly so the updater never has to infer it. */
+static void
+repo_paths_init(const char *base_dir)
 {
     const char *home = getenv("HOME");
     if (!home || !*home)
         home = "/home/lynch";
 
-    snprintf(g_repo_root, sizeof g_repo_root, "%s/jtupdate/repos", home);
+    if (base_dir && base_dir[0])
+        expand_tilde(base_dir, g_repo_root, sizeof g_repo_root);
+    else
+        snprintf(g_repo_root, sizeof g_repo_root, "%s/jtupdate/repos", home);
+
+    size_t len = strlen(g_repo_root);
+    while (len > 1 && g_repo_root[len - 1] == '/')
+        g_repo_root[--len] = '\0';
+    if (!g_repo_root[0])
+        snprintf(g_repo_root, sizeof g_repo_root, "%s/jtupdate/repos", home);
+
+    /* Show the path with ~ substituted when it lives under the home folder. */
+    size_t home_len = strlen(home);
+    if (home_len > 0 && !strncmp(g_repo_root, home, home_len) &&
+        g_repo_root[home_len] == '/')
+        snprintf(g_repo_root_show, sizeof g_repo_root_show,
+                 "~%s", g_repo_root + home_len);
+    else
+        snprintf(g_repo_root_show, sizeof g_repo_root_show,
+                 "%s", g_repo_root);
 
     for (int i = 0; i < REPO_COUNT; i++) {
         snprintf(g_repo_path[i], sizeof g_repo_path[i],
                  "%s/%s", g_repo_root, g_repos[i].slug);
         snprintf(g_repo_short[i], sizeof g_repo_short[i],
-                 "~/jtupdate/repos/%s", g_repos[i].slug);
+                 "%s/%s", g_repo_root_show, g_repos[i].slug);
     }
 }
 
@@ -1940,8 +2018,9 @@ paint_hero(cairo_t *cr, const View *v, int running)
         snprintf(sub, sizeof sub, "Progress was stopped. You can start again.");
     } else {
         snprintf(sub, sizeof sub,
-                 "Clones live in ~/jtupdate/repos. Pulls are fast-forward only; "
-                 "changed repositories are built and installed.");
+                 "Clones live in %s. Pulls are fast-forward only; "
+                 "changed repositories are built and installed.",
+                 g_repo_root_show);
     }
     text_draw_wrapped(cr, sub, 10.8, 400, C_DIM, 0.94,
                       tx, 145.0, 548.0, 0.12);
@@ -2287,7 +2366,11 @@ static void
 paint_footer(cairo_t *cr, const View *v, int running)
 {
     (void)running;
-    text_draw(cr, "CLONES IN ~/jtupdate/repos", 8.8, 400, C_FAINT, 0.78,
+    char clones[PATH_MAX + 16];
+    snprintf(clones, sizeof clones, "CLONES IN %s", g_repo_root_show);
+    for (char *p = clones; *p; p++)
+        *p = (char)toupper((unsigned char)*p);
+    text_draw(cr, clones, 8.8, 400, C_FAINT, 0.78,
               MARGIN, FOOTER_Y, ALIGN_LEFT, 0.35);
     text_draw(cr, "SPACE  CHECK     ESC  QUIT", 8.8, 600, C_FAINT, 0.62,
               WIN_W - MARGIN, FOOTER_Y, ALIGN_RIGHT, 1.0);
@@ -3622,19 +3705,27 @@ write_screenshot(const char *path)
 int
 main(int argc, char **argv)
 {
+    const char *base_dir = NULL;
+    if (!base_dir_cli(&argc, argv, &base_dir))
+        return 2;
     if (!accent_cli(&argc, argv))
         return 2;
 
+    repo_paths_init(base_dir);
+
     if (argc >= 2 && (!strcmp(argv[1], "-h") || !strcmp(argv[1], "--help"))) {
-        printf("usage: %s [ACCENT] [--screenshot PATH]\n\n"
+        printf("usage: %s [ACCENT] [--base-dir DIR] [--screenshot PATH]\n\n"
                "  ACCENT              #RRGGBB or RRGGBB, for example '#378484'\n"
                "  --accent COLOR      explicit form of ACCENT\n"
+               "  --base-dir DIR      directory that holds the checkouts\n"
+               "                      (default: ~/jtupdate/repos)\n"
                "  --screenshot PATH   render a demo frame to PATH and exit\n\n"
-               "Repositories are cloned into ~/jtupdate/repos/<slug>.\n"
+               "Repositories are cloned into %s/<slug>.\n"
                "Add their URLs to the g_repos table at the top of jtupdate.c.\n\n"
                "controls: Space/Enter check or stop, Esc/q quit\n"
                "live accent: jtupdatectl accent '#RRGGBB'\n"
-               "requires a Wayland compositor supporting xdg-shell\n", argv[0]);
+               "requires a Wayland compositor supporting xdg-shell\n",
+               argv[0], g_repo_root_show);
         return 0;
     }
 
@@ -3657,7 +3748,7 @@ main(int argc, char **argv)
     a.pointer_x = -1.0;
     a.pointer_y = -1.0;
 
-    repo_paths_init();
+    repo_paths_init(base_dir);
     state_init(&a.upd);
 
     const char *scale_env = getenv("JTUPDATE_SCALE");
