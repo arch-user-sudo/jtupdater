@@ -291,27 +291,27 @@ typedef struct {
     const char *slug;
     const char *url;
     const char *build;
+    const char *install;
 } RepoDef;
 
 /* Each checkout lives under ~/jtupdate/repos/<slug>.  An existing git checkout
- * with an empty URL would pull its current origin instead.  jtupdater has no
- * build step yet because its repository is still just a LICENSE placeholder;
- * set it to "make -j2" once the updater sources live there. */
+ * is pulled; changed repositories are built and installed. */
 static const RepoDef g_repos[REPO_COUNT] = {
     { "JTLab",       "JTLab",
-      "https://github.com/arch-user-sudo/JTLab.git",       "make -j2" },
+      "https://github.com/arch-user-sudo/JTLab.git",       "make -j2", "make install" },
     { "jtspeedtest", "jtspeedtest",
-      "https://github.com/arch-user-sudo/jtspeedtest.git", "make -j2" },
+      "https://github.com/arch-user-sudo/jtspeedtest.git", "make -j2", "make install" },
     { "jtnetworks",  "jtnetworks",
-      "https://github.com/arch-user-sudo/jtnetworks.git",  "make -j2" },
+      "https://github.com/arch-user-sudo/jtnetworks.git",  "make -j2", "make install" },
     { "jtlabwc",     "jtlabwc",
-      "https://github.com/arch-user-sudo/jtlabwc.git",     "make -j2" },
+      "https://github.com/arch-user-sudo/jtlabwc.git",     "make -j2", "make install" },
     { "jtupdate",    "jtupdater",
-      "https://github.com/arch-user-sudo/jtupdater.git",   "" },
+      "https://github.com/arch-user-sudo/jtupdater.git",   "make -j2", "make install" },
     { "jtlX",        "jtlX",
-      "https://github.com/arch-user-sudo/jtlX.git",        "make -j2" },
+      "https://github.com/arch-user-sudo/jtlX.git",        "make -j2", "make install" },
 };
 
+static char g_repo_root[PATH_MAX];
 static char g_repo_path[REPO_COUNT][PATH_MAX];
 static char g_repo_short[REPO_COUNT][160];
 
@@ -322,9 +322,11 @@ repo_paths_init(void)
     if (!home || !*home)
         home = "/home/lynch";
 
+    snprintf(g_repo_root, sizeof g_repo_root, "%s/jtupdate/repos", home);
+
     for (int i = 0; i < REPO_COUNT; i++) {
         snprintf(g_repo_path[i], sizeof g_repo_path[i],
-                 "%s/jtupdate/repos/%s", home, g_repos[i].slug);
+                 "%s/%s", g_repo_root, g_repos[i].slug);
         snprintf(g_repo_short[i], sizeof g_repo_short[i],
                  "~/jtupdate/repos/%s", g_repos[i].slug);
     }
@@ -412,6 +414,43 @@ ensure_parent(const char *path)
     return mkdir_p(parent);
 }
 
+/* Remove a file or directory tree without following symlinks. */
+static int
+rm_rf(const char *path)
+{
+    struct stat st;
+    if (lstat(path, &st) < 0)
+        return errno == ENOENT;
+
+    if (!S_ISDIR(st.st_mode))
+        return unlink(path) == 0 || errno == ENOENT;
+
+    DIR *d = opendir(path);
+    if (!d)
+        return 0;
+
+    int ok = 1;
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+        if (!strcmp(ent->d_name, ".") || !strcmp(ent->d_name, ".."))
+            continue;
+
+        char child[PATH_MAX];
+        if (snprintf(child, sizeof child, "%s/%s", path, ent->d_name) >=
+            (int)sizeof child) {
+            ok = 0;
+            continue;
+        }
+        if (!rm_rf(child))
+            ok = 0;
+    }
+    closedir(d);
+
+    if (rmdir(path) < 0 && errno != ENOENT)
+        ok = 0;
+    return ok;
+}
+
 /* ------------------------------------------------------------------ */
 /*  Background update state                                            */
 /* ------------------------------------------------------------------ */
@@ -421,6 +460,7 @@ typedef enum {
     RP_CLONING,
     RP_PULLING,
     RP_BUILDING,
+    RP_INSTALL,
     RP_DONE,
     RP_CURRENT,
     RP_ERROR,
@@ -861,6 +901,15 @@ repo_head(const char *path, char *out, size_t outn)
     return run_capture(argv, path, out, outn) && out[0] != '\0';
 }
 
+/* A checkout is only usable once HEAD resolves.  A clone interrupted midway
+ * can leave a .git directory behind, so checking for .git alone is not enough. */
+static int
+repo_valid(const char *path)
+{
+    char head[80];
+    return repo_is_git(path) && repo_head(path, head, sizeof head);
+}
+
 static int
 line_percent(const char *s, int *pct)
 {
@@ -1010,11 +1059,423 @@ worker_repo_error(UpdateState *st, int i, const char *detail)
     finish_repo(st, i, RP_ERROR, detail);
 }
 
+/* Clone into a temporary sibling first, then move it into place.  A failed or
+ * cancelled clone therefore never leaves a half-populated target behind that
+ * would block every later update.  An existing non-git folder is moved aside
+ * instead of being deleted. */
+static int
+clone_checkout(App *a, int i, const RepoDef *def, const char *path,
+               char *err, size_t errn)
+{
+    UpdateState *st = &a->upd;
+    if (err && errn)
+        err[0] = '\0';
+
+    if (!ensure_parent(path)) {
+        if (err && errn)
+            snprintf(err, errn, "Could not create the target folder");
+        return 0;
+    }
+
+    char tmp[PATH_MAX];
+    if (snprintf(tmp, sizeof tmp, "%s.clone-%ld", path, (long)getpid()) >=
+        (int)sizeof tmp) {
+        if (err && errn)
+            snprintf(err, errn, "Repository path is too long");
+        return 0;
+    }
+    rm_rf(tmp);
+
+    state_set_status(st, "Cloning %s…", def->name);
+    repo_update(st, i, RP_CLONING, 0.0, "Starting git clone…");
+    char *argv[] = { "git", "clone", "--progress",
+                     (char *)def->url, tmp, NULL };
+    int rc = run_command(a, i, argv, NULL, RP_CLONING, 0.0, 0.55);
+    if (rc <= 0) {
+        rm_rf(tmp);
+        if (rc == 0 && err && errn)
+            snprintf(err, errn, "git clone failed");
+        return rc;
+    }
+
+    if (!repo_is_git(tmp)) {
+        /* Some filesystems settle the final directory a moment after git
+         * exits; check once more before declaring the clone bad. */
+        usleep(100000);
+    }
+    if (!repo_is_git(tmp) || !repo_valid(tmp)) {
+        rm_rf(tmp);
+        if (err && errn)
+            snprintf(err, errn, "Clone finished without a usable checkout");
+        return 0;
+    }
+
+    if (path_exists(path)) {
+        if (repo_valid(path)) {
+            /* Another run got there first; keep its checkout. */
+            rm_rf(tmp);
+            return 1;
+        }
+        if (path_nonempty(path)) {
+            char old[PATH_MAX];
+            if (snprintf(old, sizeof old, "%s.incomplete-%ld-%ld", path,
+                         (long)time(NULL), (long)getpid()) >=
+                (int)sizeof old ||
+                rename(path, old) < 0) {
+                rm_rf(tmp);
+                if (err && errn)
+                    snprintf(err, errn,
+                             "Could not move the old checkout aside");
+                return 0;
+            }
+        } else if (rmdir(path) < 0 && errno != ENOENT) {
+            rm_rf(tmp);
+            if (err && errn)
+                snprintf(err, errn, "Could not replace the empty folder");
+            return 0;
+        }
+    }
+
+    if (rename(tmp, path) < 0) {
+        rm_rf(tmp);
+        if (err && errn)
+            snprintf(err, errn, "Could not move the clone into place");
+        return 0;
+    }
+    return 1;
+}
+
+/* True when an executable can be found through PATH. */
+static int
+command_exists(const char *name)
+{
+    if (!name || !*name)
+        return 0;
+    if (strchr(name, '/'))
+        return access(name, X_OK) == 0;
+
+    const char *path = getenv("PATH");
+    if (!path || !*path)
+        path = "/usr/local/bin:/usr/bin:/bin";
+    char *copy = strdup(path);
+    if (!copy)
+        return 0;
+
+    int found = 0;
+    char *save = NULL;
+    for (char *dir = strtok_r(copy, ":", &save); dir;
+         dir = strtok_r(NULL, ":", &save)) {
+        char full[PATH_MAX];
+        if (snprintf(full, sizeof full, "%s/%s", dir, name) >=
+            (int)sizeof full)
+            continue;
+        if (access(full, X_OK) == 0) {
+            found = 1;
+            break;
+        }
+    }
+    free(copy);
+    return found;
+}
+
+/* A cached doas/sudo timestamp lets the install run without a terminal. */
+static int
+elevated_cached(const char *tool)
+{
+    char out[64];
+    char *argv[] = { (char *)tool, "-n", "true", NULL };
+    return run_capture(argv, NULL, out, sizeof out);
+}
+
+static int
+run_build(App *a, int i, const RepoDef *def, const char *path,
+          double p0, double p1)
+{
+    if (!def->build || !def->build[0])
+        return 1;
+    state_set_status(&a->upd, "Building %s…", def->name);
+    repo_update(&a->upd, i, RP_BUILDING, p0, "Running the build…");
+    char *argv[] = { "/bin/sh", "-c", (char *)def->build, NULL };
+    return run_command(a, i, argv, path, RP_BUILDING, p0, p1);
+}
+
+/* The helper installed next to jtupdate performs all of the actual installs.
+ * It is also the script that `make install` puts in the updater source tree. */
+static int
+find_install_helper(char *out, size_t n)
+{
+    char exe[PATH_MAX];
+    ssize_t len = readlink("/proc/self/exe", exe, sizeof exe - 1);
+    if (len > 0) {
+        exe[len] = '\0';
+        char *slash = strrchr(exe, '/');
+        if (slash) {
+            *slash = '\0';
+            const char *names[] = {
+                "jtupdate-install",
+                "jtupdate-install.sh",
+            };
+            for (size_t i = 0; i < sizeof names / sizeof names[0]; i++) {
+                int k = snprintf(out, n, "%s/%s", exe, names[i]);
+                if (k > 0 && (size_t)k < n && access(out, X_OK) == 0)
+                    return 1;
+            }
+        }
+    }
+
+    const char *home = getenv("HOME");
+    if (home && *home) {
+        const char *paths[] = {
+            "%s/jtupdate/jtupdate-install.sh",
+            "%s/git/jtupdater/jtupdate-install.sh",
+        };
+        for (size_t i = 0; i < sizeof paths / sizeof paths[0]; i++) {
+            int k = snprintf(out, n, paths[i], home);
+            if (k > 0 && (size_t)k < n && access(out, X_OK) == 0)
+                return 1;
+        }
+    }
+    return 0;
+}
+
+/* When jtupdate is running from its source tree, install that tree instead of
+ * the cached jtupdater checkout.  This keeps a source build from being replaced
+ * by an older clone of the same repository. */
+static int
+find_self_source_dir(char *out, size_t n)
+{
+    char exe[PATH_MAX];
+    ssize_t len = readlink("/proc/self/exe", exe, sizeof exe - 1);
+    if (len <= 0)
+        return 0;
+    exe[len] = '\0';
+
+    char *slash = strrchr(exe, '/');
+    if (!slash || slash == exe)
+        return 0;
+    *slash = '\0';
+
+    char check[PATH_MAX];
+    int k = snprintf(check, sizeof check, "%s/Makefile", exe);
+    if (k <= 0 || (size_t)k >= sizeof check || access(check, F_OK) != 0)
+        return 0;
+    k = snprintf(check, sizeof check, "%s/jtupdate.c", exe);
+    if (k <= 0 || (size_t)k >= sizeof check || access(check, F_OK) != 0)
+        return 0;
+    if (strlen(exe) >= n)
+        return 0;
+    snprintf(out, n, "%s", exe);
+    return 1;
+}
+
+/* "" means we are root.  "doas"/"sudo" means that tool has a cached
+ * timestamp, so the helper can run without a terminal.  NULL means the helper
+ * must be started in a terminal so it can authenticate. */
+static const char *
+cached_elevation(void)
+{
+    if (geteuid() == 0)
+        return "";
+    if (command_exists("doas") && elevated_cached("doas"))
+        return "doas";
+    if (command_exists("sudo") && elevated_cached("sudo"))
+        return "sudo";
+    return NULL;
+}
+
+static void
+remove_install_temp(const char *plan, const char *statusdir, int count)
+{
+    if (plan)
+        unlink(plan);
+    if (statusdir) {
+        for (int p = 0; p < count; p++) {
+            char status[PATH_MAX];
+            snprintf(status, sizeof status, "%s/%d.status", statusdir, p);
+            unlink(status);
+        }
+        rmdir(statusdir);
+    }
+}
+
+/* Run one helper for every queued repository.  The helper checks doas, sudo,
+ * then pkexec and re-executes itself once, so all installs share one
+ * authorization prompt and one terminal window.
+ * Per-repo exit codes are read back from status files. */
+static int
+run_helper_installs(App *a, const int *idxs, const int *cloned, int count,
+                    const char *elev)
+{
+    UpdateState *st = &a->upd;
+    if (count <= 0)
+        return 1;
+
+    char helper[PATH_MAX];
+    if (!find_install_helper(helper, sizeof helper)) {
+        for (int p = 0; p < count; p++)
+            finish_repo(st, idxs[p], RP_ERROR,
+                        "Install helper missing — run make install");
+        return 0;
+    }
+
+    if (!mkdir_p(g_repo_root)) {
+        for (int p = 0; p < count; p++)
+            finish_repo(st, idxs[p], RP_ERROR,
+                        "Could not create the repos folder");
+        return 0;
+    }
+
+    char plan[PATH_MAX];
+    char statusdir[PATH_MAX];
+    snprintf(plan, sizeof plan, "%s/.install-%ld.plan",
+             g_repo_root, (long)getpid());
+    snprintf(statusdir, sizeof statusdir, "%s/.install-%ld.status",
+             g_repo_root, (long)getpid());
+    unlink(plan);
+    mkdir(statusdir, 0755);
+
+    FILE *f = fopen(plan, "w");
+    if (!f) {
+        for (int p = 0; p < count; p++)
+            finish_repo(st, idxs[p], RP_ERROR,
+                        "Could not create the install plan");
+        remove_install_temp(NULL, statusdir, count);
+        return 0;
+    }
+    char self_source[PATH_MAX];
+    int have_self_source = find_self_source_dir(self_source,
+                                                sizeof self_source);
+    for (int p = 0; p < count; p++) {
+        const char *path = g_repo_path[idxs[p]];
+        if (have_self_source &&
+            strcmp(g_repos[idxs[p]].slug, "jtupdater") == 0)
+            path = self_source;
+        fprintf(f, "%s\n", path);
+    }
+    fclose(f);
+
+    for (int p = 0; p < count; p++) {
+        char status[PATH_MAX];
+        snprintf(status, sizeof status, "%s/%d.status", statusdir, p);
+        unlink(status);
+        repo_update(st, idxs[p], RP_INSTALL, 0.90,
+                    "Waiting for authorization");
+    }
+
+    const char *term = NULL;
+    if (command_exists("foot"))
+        term = "foot";
+    else if (command_exists("footclient"))
+        term = "footclient";
+
+    char *argv[12];
+    int ai = 0;
+    int terminal = 0;
+
+    if (elev && !elev[0]) {
+        argv[ai++] = helper;
+    } else if (elev) {
+        argv[ai++] = (char *)elev;
+        argv[ai++] = "-n";
+        argv[ai++] = helper;
+    } else {
+        if (!term) {
+            remove_install_temp(plan, statusdir, count);
+            for (int p = 0; p < count; p++)
+                finish_repo(st, idxs[p], RP_ERROR,
+                            "Install needs doas/sudo and a terminal");
+            return 0;
+        }
+        argv[ai++] = (char *)term;
+        argv[ai++] = "-T";
+        argv[ai++] = "jtupdate install";
+        argv[ai++] = helper;
+        terminal = 1;
+    }
+    argv[ai++] = "--plan";
+    argv[ai++] = plan;
+    argv[ai++] = "--status-dir";
+    argv[ai++] = statusdir;
+    argv[ai] = NULL;
+
+    if (terminal)
+        state_set_status(st, "Installing %d repositories — authorize in "
+                         "the terminal…", count);
+    else
+        state_set_status(st, "Installing %d repositories…", count);
+
+    for (int p = 0; p < count; p++)
+        repo_update(st, idxs[p], RP_INSTALL, 0.92, "Installing binaries…");
+
+    int rc = run_command(a, idxs[0], argv, NULL, RP_INSTALL, 0.92, 1.0);
+    if (rc < 0) {
+        remove_install_temp(plan, statusdir, count);
+        for (int p = 0; p < count; p++)
+            finish_repo(st, idxs[p], RP_SKIP, "Install cancelled");
+        return -1;
+    }
+
+    for (int p = 0; p < count; p++) {
+        int code = -1;
+        char status[PATH_MAX];
+        snprintf(status, sizeof status, "%s/%d.status", statusdir, p);
+        FILE *sf = fopen(status, "r");
+        if (sf) {
+            if (fscanf(sf, "%d", &code) != 1)
+                code = -1;
+            fclose(sf);
+        }
+        unlink(status);
+
+        int i = idxs[p];
+        if (code == 0) {
+            finish_repo(st, i, RP_DONE, cloned[p]
+                        ? "Cloned, built and installed"
+                        : "Pulled, built and installed");
+        } else {
+            finish_repo(st, i, RP_ERROR, "Install failed");
+        }
+    }
+    remove_install_temp(plan, statusdir, count);
+    return 1;
+}
+
+/* Queue a changed repository for the shared install helper. */
+static int
+finish_after_build(App *a, int i, const RepoDef *def, int cloned,
+                   int *pending, int *pending_cloned, int *pending_count)
+{
+    if (!def->install || !def->install[0]) {
+        finish_repo(&a->upd, i, RP_DONE,
+                    cloned ? "Cloned and built" : "Pulled and built");
+        return 1;
+    }
+
+    if (cloned && strcmp(def->slug, "jtupdater") == 0) {
+        char self_source[PATH_MAX];
+        if (!find_self_source_dir(self_source, sizeof self_source)) {
+            finish_repo(&a->upd, i, RP_DONE,
+                        "Cloned and built — install manually");
+            return 1;
+        }
+    }
+
+    pending[*pending_count] = i;
+    pending_cloned[*pending_count] = cloned;
+    (*pending_count)++;
+    repo_update(&a->upd, i, RP_INSTALL, 0.85,
+                "Built — queued for install");
+    return 1;
+}
+
 static void *
 update_worker(void *arg)
 {
     App *a = arg;
     UpdateState *st = &a->upd;
+    int pending[REPO_COUNT];
+    int pending_cloned[REPO_COUNT];
+    int pending_count = 0;
 
     for (int i = 0; i < REPO_COUNT; i++) {
         if (state_cancelled(st))
@@ -1030,7 +1491,7 @@ update_worker(void *arg)
         state_set_status(st, "Checking %s…", def->name);
         repo_update(st, i, RP_QUEUED, 0.0, "Checking the checkout…");
 
-        int is_git = repo_is_git(path);
+        int is_git = repo_valid(path);
 
         if (!is_git) {
             if (!def->url[0]) {
@@ -1038,48 +1499,33 @@ update_worker(void *arg)
                             "No URL configured in jtupdate.c");
                 continue;
             }
-            if (path_exists(path) && path_nonempty(path)) {
-                worker_repo_error(st, i,
-                    "Target exists but is not a git checkout");
-                continue;
-            }
-            if (!ensure_parent(path)) {
-                worker_repo_error(st, i, "Could not create the target folder");
-                continue;
-            }
 
-            state_set_status(st, "Cloning %s…", def->name);
-            repo_update(st, i, RP_CLONING, 0.0, "Starting git clone…");
-            char *argv[] = { "git", "clone", "--progress",
-                             (char *)def->url, (char *)path, NULL };
-            int rc = run_command(a, i, argv, NULL, RP_CLONING, 0.0, 0.55);
+            char err[160] = "";
+            int rc = clone_checkout(a, i, def, path, err, sizeof err);
             if (rc < 0)
                 goto out;
             if (rc == 0) {
-                worker_repo_error(st, i, "git clone failed");
+                worker_repo_error(st, i,
+                                  err[0] ? err : "git clone failed");
                 continue;
             }
 
-            is_git = repo_is_git(path);
+            is_git = repo_valid(path);
             if (!is_git) {
                 worker_repo_error(st, i, "Clone finished without .git");
                 continue;
             }
 
-            if (def->build && def->build[0]) {
-                state_set_status(st, "Building %s…", def->name);
-                repo_update(st, i, RP_BUILDING, 0.55, "Running the build…");
-                char *bargv[] = { "/bin/sh", "-c",
-                                  (char *)def->build, NULL };
-                rc = run_command(a, i, bargv, path, RP_BUILDING, 0.55, 0.98);
-                if (rc < 0)
-                    goto out;
-                if (rc == 0) {
-                    worker_repo_error(st, i, "Build failed");
-                    continue;
-                }
+            rc = run_build(a, i, def, path, 0.55, 0.85);
+            if (rc < 0)
+                goto out;
+            if (rc == 0) {
+                worker_repo_error(st, i, "Build failed");
+                continue;
             }
-            finish_repo(st, i, RP_DONE, "Cloned and built");
+            if (finish_after_build(a, i, def, 1, pending, pending_cloned,
+                                   &pending_count) < 0)
+                goto out;
             continue;
         }
 
@@ -1112,22 +1558,29 @@ update_worker(void *arg)
             continue;
         }
 
-        if (def->build && def->build[0]) {
-            state_set_status(st, "Building %s…", def->name);
-            repo_update(st, i, RP_BUILDING, 0.55, "Running the build…");
-            char *bargv[] = { "/bin/sh", "-c", (char *)def->build, NULL };
-            rc = run_command(a, i, bargv, path, RP_BUILDING, 0.55, 0.98);
-            if (rc < 0)
-                goto out;
-            if (rc == 0) {
-                worker_repo_error(st, i, "Build failed");
-                continue;
-            }
+        rc = run_build(a, i, def, path, 0.55, 0.85);
+        if (rc < 0)
+            goto out;
+        if (rc == 0) {
+            worker_repo_error(st, i, "Build failed");
+            continue;
         }
-        finish_repo(st, i, RP_DONE, "Pulled and built");
+        if (finish_after_build(a, i, def, 0, pending, pending_cloned,
+                               &pending_count) < 0)
+            goto out;
+    }
+
+    if (run_helper_installs(a, pending, pending_cloned, pending_count,
+                            cached_elevation()) < 0) {
+        pending_count = 0;
+        goto out;
     }
 
 out:
+    if (pending_count > 0 && state_cancelled(st)) {
+        for (int p = 0; p < pending_count; p++)
+            finish_repo(st, pending[p], RP_SKIP, "Install cancelled");
+    }
     state_finish(st, state_cancelled(st));
     return NULL;
 }
@@ -1264,7 +1717,8 @@ typedef struct {
 static int
 repo_active(RepoPhase ph)
 {
-    return ph == RP_CLONING || ph == RP_PULLING || ph == RP_BUILDING;
+    return ph == RP_CLONING || ph == RP_PULLING || ph == RP_BUILDING ||
+           ph == RP_INSTALL;
 }
 
 static unsigned
@@ -1274,6 +1728,7 @@ repo_color(RepoPhase ph)
     case RP_CLONING:
     case RP_PULLING:
     case RP_BUILDING:
+    case RP_INSTALL:
         return C_ACCENT;
     case RP_DONE:
     case RP_CURRENT:
@@ -1295,6 +1750,7 @@ repo_pill(RepoPhase ph)
     case RP_CLONING: return "CLONE";
     case RP_PULLING: return "PULL";
     case RP_BUILDING: return "BUILD";
+    case RP_INSTALL: return "INSTALL";
     case RP_DONE: return "UPDATED";
     case RP_CURRENT: return "CURRENT";
     case RP_ERROR: return "ERROR";
@@ -1418,7 +1874,7 @@ paint_header(cairo_t *cr, const View *v)
                           49.0, 19.0, ALIGN_LEFT, 0.1);
     text_draw(cr, "Updater", 15.0, 400, C_DIM, 0.86,
               49.0 + w1 + 5.0, 19.0, ALIGN_LEFT, 0.1);
-    text_draw(cr, "repositories · git · build", 9.0, 400, C_FAINT, 0.75,
+    text_draw(cr, "repositories · git · build · install", 9.0, 400, C_FAINT, 0.75,
               49.0, 39.0, ALIGN_LEFT, 0.55);
 
     rgba(cr, C_FG, 0.045);
@@ -1485,7 +1941,7 @@ paint_hero(cairo_t *cr, const View *v, int running)
     } else {
         snprintf(sub, sizeof sub,
                  "Clones live in ~/jtupdate/repos. Pulls are fast-forward only; "
-                 "builds run after changes.");
+                 "changed repositories are built and installed.");
     }
     text_draw_wrapped(cr, sub, 10.8, 400, C_DIM, 0.94,
                       tx, 145.0, 548.0, 0.12);

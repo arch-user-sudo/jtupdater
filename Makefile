@@ -65,11 +65,13 @@ tablet-protocol.c: $(TABLET_XML)
 install: jtupdate jtupdatectl
 	install -Dm755 jtupdate $(DESTDIR)$(BINDIR)/jtupdate
 	install -Dm755 jtupdatectl $(DESTDIR)$(BINDIR)/jtupdatectl
+	install -Dm755 jtupdate-install.sh $(DESTDIR)$(BINDIR)/jtupdate-install
 	@echo "installed to $(DESTDIR)$(PREFIX)"
 
 uninstall:
 	rm -f $(DESTDIR)$(BINDIR)/jtupdate
 	rm -f $(DESTDIR)$(BINDIR)/jtupdatectl
+	rm -f $(DESTDIR)$(BINDIR)/jtupdate-install
 
 preview: jtupdate
 	./jtupdate --screenshot preview.png
