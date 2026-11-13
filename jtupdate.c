@@ -349,8 +349,8 @@ static const RepoDef g_repos[REPO_COUNT] = {
       "https://github.com/arch-user-sudo/jtlabwc.git",     "make -j2", "make install" },
     { "jtupdate",    "jtupdater",
       "https://github.com/arch-user-sudo/jtupdater.git",   "make -j2", "make install" },
-    { "jtlX",        "jtlX",
-      "https://github.com/arch-user-sudo/jtlX.git",        "make -j2", "make install" },
+    { "jtsettings",        "jtsettings",
+      "https://github.com/arch-user-sudo/jtsettings.git",        "make -j2", "make install" },
     { "jtwpi",        "jtwpi",
       "https://github.com/arch-user-sudo/jtwpi.git",        "make -j2", "make install" },
 };
