@@ -70,7 +70,10 @@
  * table below. */
 #define REPO_COUNT 7
 
-#define WIN_W 760.0
+#define WIN_W_DESIGN 760.0
+#define WIN_H_DESIGN 910.0
+static double WIN_W = WIN_W_DESIGN;
+static double WIN_H = WIN_H_DESIGN;
 
 #define MARGIN 24.0
 #define HEADER_H 58.0
@@ -78,17 +81,31 @@
 #define HERO_H 126.0
 #define LIST_LABEL_Y 218.0
 #define LIST_Y 238.0
-#define ROW_H 62.0
-#define ROW_GAP 8.0
-#define PROGRESS_Y (LIST_Y + REPO_COUNT * (ROW_H + ROW_GAP) + 12.0)
 #define PROGRESS_H 76.0
-#define BUTTON_Y (PROGRESS_Y + PROGRESS_H + 14.0)
 #define BUTTON_W 220.0
 #define BUTTON_H 46.0
 
-/* Footer sits just inside the bottom edge; the button keeps the same gap
- * above it that the original four-repo window had. */
-#define WIN_H (BUTTON_Y + BUTTON_H + 34.0)
+/* The repository list stretches to absorb extra window height, keeping the
+ * footer anchored to the bottom edge. */
+static double ROW_H = 62.0;
+static double ROW_GAP = 8.0;
+static double PROGRESS_Y = 740.0;
+static double BUTTON_Y = 830.0;
+
+static void
+layout_update(void)
+{
+    double extra = WIN_H - WIN_H_DESIGN;
+    if (extra < 0.0)
+        extra = 0.0;
+    double grow = extra / (2.0 * REPO_COUNT);
+    ROW_H = 62.0 + grow;
+    ROW_GAP = 8.0 + grow;
+    PROGRESS_Y = LIST_Y + REPO_COUNT * (ROW_H + ROW_GAP) + 12.0;
+    BUTTON_Y = PROGRESS_Y + PROGRESS_H + 14.0;
+}
+
+/* Footer sits just inside the bottom edge. */
 #define FOOTER_Y (WIN_H - 16.0)
 
 #define FONT_FAMILY "Liberation"
@@ -2370,6 +2387,8 @@ paint_content(cairo_t *cr, const View *v)
     const UpdateSnap *s = v->s;
     int running = s->phase == UP_RUNNING;
 
+    layout_update();
+
     cairo_save(cr);
     cairo_rectangle(cr, 0.0, 0.0, WIN_W, WIN_H);
     cairo_clip(cr);
@@ -2403,6 +2422,7 @@ paint_content(cairo_t *cr, const View *v)
 static int
 hit_primary(double x, double y)
 {
+    layout_update();
     double bx = (WIN_W - BUTTON_W) / 2.0;
     return x >= bx && x <= bx + BUTTON_W &&
            y >= BUTTON_Y && y <= BUTTON_Y + BUTTON_H;
@@ -2411,6 +2431,7 @@ hit_primary(double x, double y)
 static int
 repo_at(double x, double y)
 {
+    layout_update();
     double x0 = MARGIN;
     double x1 = WIN_W - MARGIN;
     if (x < x0 || x > x1)
@@ -2665,7 +2686,7 @@ app_draw(App *a, const UpdateSnap *s)
 
     cairo_t *cr = cairo_create(surf);
     cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
-    cairo_set_source_rgba(cr, 0, 0, 0, 0);
+    cairo_set_source_rgba(cr, R_(C_BG), G_(C_BG), B_(C_BG), 1.0);
     cairo_paint(cr);
     cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
     cairo_scale(cr, a->scale, a->scale);
@@ -2769,7 +2790,12 @@ static void
 toplevel_configure(void *data, struct xdg_toplevel *t,
                    int32_t width, int32_t height, struct wl_array *states)
 {
-    (void)data; (void)t; (void)width; (void)height; (void)states;
+    (void)t; (void)states;
+    (void)data;
+    if (width > 0 && height > 0) {
+        WIN_W = width;
+        WIN_H = height;
+    }
 }
 
 static void
@@ -3228,8 +3254,8 @@ wayland_start(App *a)
     xdg_toplevel_add_listener(a->toplevel, &toplevel_listener, a);
     xdg_toplevel_set_title(a->toplevel, "JTLab Updater");
     xdg_toplevel_set_app_id(a->toplevel, "jtupdate");
-    xdg_toplevel_set_min_size(a->toplevel, (int)WIN_W, (int)WIN_H);
-    xdg_toplevel_set_max_size(a->toplevel, (int)WIN_W, (int)WIN_H);
+    xdg_toplevel_set_min_size(a->toplevel, (int)WIN_W_DESIGN,
+                              (int)WIN_H_DESIGN);
 
     if (a->deco_manager) {
         a->decoration = zxdg_decoration_manager_v1_get_toplevel_decoration(
