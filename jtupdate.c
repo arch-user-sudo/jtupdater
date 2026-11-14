@@ -652,7 +652,6 @@ struct App {
 
     int hover_primary;
     int press_primary;
-    int hover_close;
     int hover_repo;
     int quit;
 
@@ -1785,7 +1784,6 @@ typedef struct {
     double disp;
     int hover_primary;
     int press_primary;
-    int hover_close;
     int hover_repo;
     double done_t;
 } View;
@@ -1943,6 +1941,8 @@ paint_hero_icon(cairo_t *cr, const View *v, int running)
 static void
 paint_header(cairo_t *cr, const View *v)
 {
+    (void)v;
+
     for (int i = 0; i < 4; i++) {
         double h = 6.0 + i * 3.0;
         rgba(cr, C_ACCENT, 0.55 + i * 0.12);
@@ -1961,21 +1961,6 @@ paint_header(cairo_t *cr, const View *v)
     cairo_set_line_width(cr, 1.0);
     cairo_move_to(cr, 24.0, 56.5);
     cairo_line_to(cr, WIN_W - 24.0, 56.5);
-    cairo_stroke(cr);
-
-    double ccx = WIN_W - 30.0;
-    double ccy = 28.0;
-    if (v->hover_close) {
-        rgba(cr, C_FG, 0.07);
-        cairo_arc(cr, ccx, ccy, 15.0, 0.0, 2.0 * PI);
-        cairo_fill(cr);
-    }
-    rgba(cr, v->hover_close ? C_FG : C_DIM, v->hover_close ? 0.9 : 0.62);
-    cairo_set_line_width(cr, 1.35);
-    cairo_move_to(cr, ccx - 5.0, ccy - 5.0);
-    cairo_line_to(cr, ccx + 5.0, ccy + 5.0);
-    cairo_move_to(cr, ccx + 5.0, ccy - 5.0);
-    cairo_line_to(cr, ccx - 5.0, ccy + 5.0);
     cairo_stroke(cr);
 }
 
@@ -2386,7 +2371,7 @@ paint_content(cairo_t *cr, const View *v)
     int running = s->phase == UP_RUNNING;
 
     cairo_save(cr);
-    rounded_rect(cr, 0.5, 0.5, WIN_W - 1.0, WIN_H - 1.0, 12.0);
+    cairo_rectangle(cr, 0.0, 0.0, WIN_W, WIN_H);
     cairo_clip(cr);
 
     cairo_pattern_t *bg = cairo_pattern_create_linear(0.0, 0.0, 0.0, WIN_H);
@@ -2409,11 +2394,6 @@ paint_content(cairo_t *cr, const View *v)
     paint_footer(cr, v, running);
 
     cairo_restore(cr);
-
-    rgba(cr, C_BORDER, 1.0);
-    cairo_set_line_width(cr, 1.0);
-    rounded_rect(cr, 0.5, 0.5, WIN_W - 1.0, WIN_H - 1.0, 12.0);
-    cairo_stroke(cr);
 }
 
 /* ------------------------------------------------------------------ */
@@ -2426,12 +2406,6 @@ hit_primary(double x, double y)
     double bx = (WIN_W - BUTTON_W) / 2.0;
     return x >= bx && x <= bx + BUTTON_W &&
            y >= BUTTON_Y && y <= BUTTON_Y + BUTTON_H;
-}
-
-static int
-hit_close(double x, double y)
-{
-    return x >= WIN_W - 48.0 && y <= 56.0;
 }
 
 static int
@@ -2521,7 +2495,7 @@ update_cursor(App *a)
     }
 
     uint32_t shape = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_DEFAULT;
-    if (a->hover_close || a->hover_primary) {
+    if (a->hover_primary) {
         shape = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_POINTER;
     } else if (a->pointer_x >= 0.0 && a->pointer_y >= 0.0 &&
                a->pointer_y < 58.0) {
@@ -2703,7 +2677,6 @@ app_draw(App *a, const UpdateSnap *s)
     v.disp = a->disp;
     v.hover_primary = a->hover_primary;
     v.press_primary = a->press_primary;
-    v.hover_close = a->hover_close;
     v.hover_repo = a->hover_repo;
     v.done_t = a->done_t;
 
@@ -2910,7 +2883,6 @@ pointer_enter(void *data, struct wl_pointer *pointer, uint32_t serial,
     a->pointer_y = wl_fixed_to_double(sy);
     a->cursor_shape = 0;
     a->hover_primary = hit_primary(a->pointer_x, a->pointer_y);
-    a->hover_close = hit_close(a->pointer_x, a->pointer_y);
     a->hover_repo = repo_at(a->pointer_x, a->pointer_y);
     update_cursor(a);
 }
@@ -2924,7 +2896,6 @@ pointer_leave(void *data, struct wl_pointer *pointer, uint32_t serial,
     a->pointer_x = -1;
     a->pointer_y = -1;
     a->hover_primary = 0;
-    a->hover_close = 0;
     a->hover_repo = -1;
     a->press_primary = 0;
     update_cursor(a);
@@ -2939,7 +2910,6 @@ pointer_motion(void *data, struct wl_pointer *pointer, uint32_t time,
     a->pointer_x = wl_fixed_to_double(sx);
     a->pointer_y = wl_fixed_to_double(sy);
     a->hover_primary = hit_primary(a->pointer_x, a->pointer_y);
-    a->hover_close = hit_close(a->pointer_x, a->pointer_y);
     a->hover_repo = repo_at(a->pointer_x, a->pointer_y);
     update_cursor(a);
 }
@@ -2957,13 +2927,10 @@ pointer_button(void *data, struct wl_pointer *pointer, uint32_t serial,
     double x = a->pointer_x;
     double y = a->pointer_y;
     a->hover_primary = hit_primary(x, y);
-    a->hover_close = hit_close(x, y);
     a->hover_repo = repo_at(x, y);
 
     if (state == WL_POINTER_BUTTON_STATE_PRESSED) {
-        if (hit_close(x, y)) {
-            a->quit = 1;
-        } else if (hit_primary(x, y)) {
+        if (hit_primary(x, y)) {
             a->press_primary = 1;
         } else if (y < 58.0) {
             if (a->toplevel && a->seat)
@@ -3270,7 +3237,7 @@ wayland_start(App *a)
         zxdg_toplevel_decoration_v1_add_listener(
             a->decoration, &decoration_listener, a);
         zxdg_toplevel_decoration_v1_set_mode(
-            a->decoration, ZXDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE);
+            a->decoration, ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
     }
 
     if (a->icon_manager) {
@@ -3681,7 +3648,6 @@ write_screenshot(const char *path)
     v.disp = 0.61;
     v.hover_primary = 0;
     v.press_primary = 0;
-    v.hover_close = 0;
     v.hover_repo = -1;
     v.done_t = -1.0;
 
