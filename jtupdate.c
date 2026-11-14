@@ -646,6 +646,13 @@ struct App {
     uint32_t cursor_shape;
 
     int configured;
+
+    /* Window geometry remembered across runs.  Wayland leaves placement to
+     * the compositor, so only size and maximized state are persisted. */
+    int state_w;
+    int state_h;
+    int state_maximized;
+
     int scale;
     int fixed_scale;
     int has_argb;
@@ -680,6 +687,82 @@ struct App {
     char ctl_buf[256];
     size_t ctl_len;
 };
+
+/* ------------------------------------------------------------------ */
+/*  Remembered window state                                            */
+/* ------------------------------------------------------------------ */
+
+#define STATE_APP "jtupdate"
+
+static void
+state_path(char *out, size_t n)
+{
+    const char *base = getenv("XDG_STATE_HOME");
+    if (base && *base) {
+        snprintf(out, n, "%s/jt/%s.conf", base, STATE_APP);
+        return;
+    }
+    const char *home = getenv("HOME");
+    if (!home || !*home)
+        home = ".";
+    snprintf(out, n, "%s/.local/state/jt/%s.conf", home, STATE_APP);
+}
+
+static void
+state_load(App *a)
+{
+    a->state_w = (int)WIN_W_DESIGN;
+    a->state_h = (int)WIN_H_DESIGN;
+    a->state_maximized = 0;
+
+    char path[512];
+    state_path(path, sizeof path);
+
+    FILE *f = fopen(path, "r");
+    if (!f)
+        return;
+
+    char line[256];
+    while (fgets(line, sizeof line, f)) {
+        char key[64];
+        int value;
+        if (sscanf(line, " %63[^= \t] = %d", key, &value) != 2)
+            continue;
+        if (!strcmp(key, "width") && value > 0)
+            a->state_w = value;
+        else if (!strcmp(key, "height") && value > 0)
+            a->state_h = value;
+        else if (!strcmp(key, "maximized"))
+            a->state_maximized = value != 0;
+    }
+    fclose(f);
+}
+
+static void
+state_save(App *a)
+{
+    if (a->state_w <= 0 || a->state_h <= 0)
+        return;
+
+    char path[512];
+    state_path(path, sizeof path);
+
+    char dir[512];
+    snprintf(dir, sizeof dir, "%s", path);
+    char *slash = strrchr(dir, '/');
+    if (slash) {
+        *slash = '\0';
+        mkdir_p(dir);
+    }
+
+    FILE *f = fopen(path, "w");
+    if (!f)
+        return;
+
+    fprintf(f, "width=%d\nheight=%d\nmaximized=%d\n",
+            a->state_w, a->state_h, a->state_maximized);
+    fclose(f);
+}
 
 static void start_update(App *a);
 
@@ -2790,11 +2873,28 @@ static void
 toplevel_configure(void *data, struct xdg_toplevel *t,
                    int32_t width, int32_t height, struct wl_array *states)
 {
-    (void)t; (void)states;
-    (void)data;
+    App *a = data;
+    (void)t;
+
+    int maximized = 0;
+    int fullscreen = 0;
+    uint32_t *state;
+    wl_array_for_each(state, states) {
+        if (*state == XDG_TOPLEVEL_STATE_MAXIMIZED)
+            maximized = 1;
+        else if (*state == XDG_TOPLEVEL_STATE_FULLSCREEN)
+            fullscreen = 1;
+    }
+
+    a->state_maximized = maximized;
+
     if (width > 0 && height > 0) {
         WIN_W = width;
         WIN_H = height;
+        if (!maximized && !fullscreen) {
+            a->state_w = width;
+            a->state_h = height;
+        }
     }
 }
 
@@ -3256,6 +3356,17 @@ wayland_start(App *a)
     xdg_toplevel_set_app_id(a->toplevel, "jtupdate");
     xdg_toplevel_set_min_size(a->toplevel, (int)WIN_W_DESIGN,
                               (int)WIN_H_DESIGN);
+
+    if (a->state_w > 0 && a->state_h > 0) {
+        if (a->state_w < (int)WIN_W_DESIGN)
+            a->state_w = (int)WIN_W_DESIGN;
+        if (a->state_h < (int)WIN_H_DESIGN)
+            a->state_h = (int)WIN_H_DESIGN;
+        WIN_W = a->state_w;
+        WIN_H = a->state_h;
+    }
+    if (a->state_maximized)
+        xdg_toplevel_set_maximized(a->toplevel);
 
     if (a->deco_manager) {
         a->decoration = zxdg_decoration_manager_v1_get_toplevel_decoration(
@@ -3741,6 +3852,7 @@ main(int argc, char **argv)
     a.hover_repo = -1;
     a.pointer_x = -1.0;
     a.pointer_y = -1.0;
+    state_load(&a);
 
     repo_paths_init(base_dir);
     state_init(&a.upd);
@@ -3821,6 +3933,8 @@ main(int argc, char **argv)
             break;
     }
 
+    if (a.configured)
+        state_save(&a);
     app_cleanup(&a);
     pthread_mutex_destroy(&a.upd.lock);
     return 0;
