@@ -646,6 +646,11 @@ struct App {
     uint32_t cursor_shape;
 
     int configured;
+    int dirty;
+
+    /* One outstanding wl_surface.frame callback.  Painting is paced by the
+     * compositor: at most one paint per refresh, and none while idle. */
+    struct wl_callback *frame_cb;
 
     /* Window geometry remembered across runs.  Wayland leaves placement to
      * the compositor, so only size and maximized state are persisted. */
@@ -1938,23 +1943,66 @@ repo_pill(RepoPhase ph)
     }
 }
 
+#define GLOW_SIZE 256
+
+static cairo_surface_t *g_ambient_glow;
+static unsigned g_ambient_glow_accent;
+
+static cairo_surface_t *glow_make(int size, double inner_ratio,
+                                  unsigned rgb, double amid)
+{
+    cairo_surface_t *s = cairo_image_surface_create(CAIRO_FORMAT_ARGB32,
+                                                    size, size);
+    cairo_t *cr = cairo_create(s);
+    double c = size / 2.0;
+    cairo_pattern_t *p = cairo_pattern_create_radial(
+        c, c, c * inner_ratio, c, c, c);
+    cairo_pattern_add_color_stop_rgba(p, 0.0,
+        R_(rgb), G_(rgb), B_(rgb), 1.0);
+    if (amid >= 0.0)
+        cairo_pattern_add_color_stop_rgba(p, 0.55,
+            R_(rgb), G_(rgb), B_(rgb), amid);
+    cairo_pattern_add_color_stop_rgba(p, 1.0,
+        R_(rgb), G_(rgb), B_(rgb), 0.0);
+    cairo_set_source(cr, p);
+    cairo_paint(cr);
+    cairo_pattern_destroy(p);
+    cairo_destroy(cr);
+    return s;
+}
+
+static void glow_paint(cairo_t *cr, cairo_surface_t *s,
+                       double cx, double cy, double radius, double alpha)
+{
+    int size = cairo_image_surface_get_width(s);
+    double k = (2.0 * radius) / size;
+    cairo_save(cr);
+    cairo_translate(cr, cx - radius, cy - radius);
+    cairo_scale(cr, k, k);
+    cairo_set_source_surface(cr, s, 0.0, 0.0);
+    cairo_pattern_set_filter(cairo_get_source(cr), CAIRO_FILTER_BILINEAR);
+    cairo_paint_with_alpha(cr, alpha);
+    cairo_restore(cr);
+}
+
+static void ambient_glow_ensure(void)
+{
+    if (g_ambient_glow && g_ambient_glow_accent == accent_rgb)
+        return;
+    if (g_ambient_glow)
+        cairo_surface_destroy(g_ambient_glow);
+    g_ambient_glow = glow_make(GLOW_SIZE, 12.0 / 218.0, accent_rgb, 0.28);
+    g_ambient_glow_accent = accent_rgb;
+}
+
 static void
 paint_ambient(cairo_t *cr, const View *v, int running)
 {
     double breath = 0.5 + 0.5 * sin(v->t * 0.55);
     double glow = (running ? 0.075 : 0.038) * (0.72 + 0.28 * breath);
 
-    cairo_pattern_t *pat = cairo_pattern_create_radial(
-        HERO_CX, HERO_CY, 12.0, HERO_CX, HERO_CY, 218.0);
-    cairo_pattern_add_color_stop_rgba(pat, 0.00,
-        R_(C_ACCENT), G_(C_ACCENT), B_(C_ACCENT), glow);
-    cairo_pattern_add_color_stop_rgba(pat, 0.55,
-        R_(C_ACCENT), G_(C_ACCENT), B_(C_ACCENT), glow * 0.28);
-    cairo_pattern_add_color_stop_rgba(pat, 1.00,
-        R_(C_ACCENT), G_(C_ACCENT), B_(C_ACCENT), 0.0);
-    cairo_set_source(cr, pat);
-    cairo_paint(cr);
-    cairo_pattern_destroy(pat);
+    ambient_glow_ensure();
+    glow_paint(cr, g_ambient_glow, HERO_CX, HERO_CY, 218.0, glow);
 
     for (int k = 0; k < 3; k++) {
         double r = HERO_R + 9.0 + k * 10.0 +
@@ -2746,6 +2794,28 @@ next_buffer(App *a, int w, int h)
 }
 
 static void
+frame_done(void *data, struct wl_callback *cb, uint32_t time)
+{
+    (void)time;
+    App *a = data;
+    wl_callback_destroy(cb);
+    a->frame_cb = NULL;
+}
+
+static const struct wl_callback_listener frame_listener = {
+    .done = frame_done,
+};
+
+static void
+request_frame(App *a)
+{
+    if (!a->surface || a->frame_cb)
+        return;
+    a->frame_cb = wl_surface_frame(a->surface);
+    wl_callback_add_listener(a->frame_cb, &frame_listener, a);
+}
+
+static void
 app_draw(App *a, const UpdateSnap *s)
 {
     if (!a->configured || !a->surface || !a->shm)
@@ -2794,6 +2864,7 @@ app_draw(App *a, const UpdateSnap *s)
         wl_surface_set_buffer_scale(a->surface, a->scale);
     wl_surface_attach(a->surface, b->buffer, 0, 0);
     wl_surface_damage(a->surface, 0, 0, (int)WIN_W, (int)WIN_H);
+    request_frame(a);
     wl_surface_commit(a->surface);
     b->busy = 1;
 }
@@ -2863,6 +2934,7 @@ xdg_surface_configure(void *data, struct xdg_surface *xs, uint32_t serial)
     App *a = data;
     xdg_surface_ack_configure(xs, serial);
     a->configured = 1;
+    a->dirty = 1;
 }
 
 static const struct xdg_surface_listener xdg_surface_listener = {
@@ -2896,6 +2968,7 @@ toplevel_configure(void *data, struct xdg_toplevel *t,
             a->state_h = height;
         }
     }
+    a->dirty = 1;
 }
 
 static void
@@ -3010,6 +3083,7 @@ pointer_enter(void *data, struct wl_pointer *pointer, uint32_t serial,
     a->cursor_shape = 0;
     a->hover_primary = hit_primary(a->pointer_x, a->pointer_y);
     a->hover_repo = repo_at(a->pointer_x, a->pointer_y);
+    a->dirty = 1;
     update_cursor(a);
 }
 
@@ -3024,6 +3098,7 @@ pointer_leave(void *data, struct wl_pointer *pointer, uint32_t serial,
     a->hover_primary = 0;
     a->hover_repo = -1;
     a->press_primary = 0;
+    a->dirty = 1;
     update_cursor(a);
 }
 
@@ -3037,6 +3112,7 @@ pointer_motion(void *data, struct wl_pointer *pointer, uint32_t time,
     a->pointer_y = wl_fixed_to_double(sy);
     a->hover_primary = hit_primary(a->pointer_x, a->pointer_y);
     a->hover_repo = repo_at(a->pointer_x, a->pointer_y);
+    a->dirty = 1;
     update_cursor(a);
 }
 
@@ -3067,6 +3143,7 @@ pointer_button(void *data, struct wl_pointer *pointer, uint32_t serial,
         if (hit_primary(x, y))
             toggle_update(a);
     }
+    a->dirty = 1;
     update_cursor(a);
 }
 
@@ -3175,6 +3252,7 @@ keyboard_key(void *data, struct wl_keyboard *keyboard, uint32_t serial,
     if (state != WL_KEYBOARD_KEY_STATE_PRESSED || !a->xkb_state)
         return;
 
+    a->dirty = 1;
     xkb_keysym_t sym = xkb_state_key_get_one_sym(a->xkb_state, key + 8);
     if (sym == XKB_KEY_Escape || sym == XKB_KEY_q) {
         a->quit = 1;
@@ -3426,13 +3504,13 @@ ctl_handle_line(App *a, char *line)
     if (!strcmp(line, "update")) {
         if (!update_is_running(a))
             start_update(a);
-        a->last_draw = -1.0;
+        a->dirty = 1;
         return;
     }
 
     if (!strcmp(line, "stop")) {
         stop_update(a);
-        a->last_draw = -1.0;
+        a->dirty = 1;
         return;
     }
 
@@ -3444,7 +3522,7 @@ ctl_handle_line(App *a, char *line)
         unsigned rgb;
         if (accent_parse(arg, &rgb)) {
             accent_set(rgb);
-            a->last_draw = -1.0;
+            a->dirty = 1;
         }
     }
 }
@@ -3658,6 +3736,10 @@ app_cleanup(App *a)
 {
     ctl_cleanup(a);
 
+    if (a->frame_cb) {
+        wl_callback_destroy(a->frame_cb);
+        a->frame_cb = NULL;
+    }
     if (a->worker_alive) {
         pthread_mutex_lock(&a->upd.lock);
         a->upd.cancel = 1;
@@ -3887,12 +3969,20 @@ main(int argc, char **argv)
 
     a.t0 = mono_sec();
     double last = mono_sec();
+    UpdateSnap prev_snap;
+    memset(&prev_snap, 0, sizeof prev_snap);
 
     while (!a.quit && !g_signal_quit) {
         app_reap(&a);
 
         UpdateSnap s;
+        memset(&s, 0, sizeof s);
         state_snapshot(&a.upd, &s);
+
+        if (memcmp(&s, &prev_snap, sizeof s) != 0) {
+            prev_snap = s;
+            a.dirty = 1;
+        }
 
         double now = mono_sec();
         double dt = now - last;
@@ -3914,13 +4004,20 @@ main(int argc, char **argv)
             a.disp = target;
 
         double interval = s.running ? 1.0 / 60.0 : 1.0 / 30.0;
-        if (a.configured && now - a.last_draw >= interval) {
+        int due = a.dirty || now - a.last_draw >= interval;
+        if (a.configured && due && !a.frame_cb) {
             app_draw(&a, &s);
+            a.dirty = 0;
             a.last_draw = now;
         }
 
+        /* Pending frame callbacks wake us at the next refresh, so resizes
+         * repaint immediately.  With no callback outstanding we sleep until
+         * the next ambient animation frame. */
         int timeout;
         if (!a.configured) {
+            timeout = 100;
+        } else if (a.frame_cb) {
             timeout = 100;
         } else {
             double wait = interval - (mono_sec() - a.last_draw);
