@@ -81,6 +81,10 @@ never replaces itself with an older checkout.
 - `Space` / `Enter` — check for updates, or stop while running
 - `Esc` / `q` — quit
 - Drag the header to move the window
+- Scroll over the repository list, drag the scrollbar, or click its track to
+  page through repositories
+- Resize the window down to 760×620; the list scrolls while the progress,
+  button, and footer stay in place
 - `jtupdatectl accent '#RRGGBB'` — live theme change
 
 JTLab's workspace popup has an Updater button: it launches `jtupdate` with the

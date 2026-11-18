@@ -18,6 +18,7 @@
  *   Space / Enter        check for updates (or stop while running)
  *   Esc / q              quit
  *   Drag header          move the window
+ *   Wheel / scrollbar    scroll the repository list
  *   Accent CLI / socket  live theme updates
  *
  * Palette from ~/JTLab/config.h:
@@ -65,13 +66,13 @@
 /*  Look & feel                                                        */
 /* ------------------------------------------------------------------ */
 
-/* Number of managed repositories. The window grows vertically to show every
- * row without scrolling, so adding a repo only changes this value and the
- * table below. */
+/* Number of managed repositories. The list scrolls, so the window no longer
+ * has to grow to fit every row. */
 #define REPO_COUNT 8
 
 #define WIN_W_DESIGN 760.0
 #define WIN_H_DESIGN 910.0
+#define WIN_H_MIN    620.0
 static double WIN_W = WIN_W_DESIGN;
 static double WIN_H = WIN_H_DESIGN;
 
@@ -85,24 +86,83 @@ static double WIN_H = WIN_H_DESIGN;
 #define BUTTON_W 220.0
 #define BUTTON_H 46.0
 
-/* The repository list stretches to absorb extra window height, keeping the
- * footer anchored to the bottom edge. */
-static double ROW_H = 62.0;
-static double ROW_GAP = 8.0;
+#define ROW_H   62.0
+#define ROW_GAP 8.0
+
+/* The scrollbar sits just inside the right edge of the list. */
+#define SCROLL_W    6.0
+#define SCROLL_GAP 10.0
+#define SCROLL_MIN_THUMB 24.0
+
+/* Space below the list for progress, button, and footer. */
+#define BOTTOM_RESERVE 170.0
+
 static double PROGRESS_Y = 740.0;
 static double BUTTON_Y = 830.0;
+static double LIST_VIEW_BOTTOM = 728.0;
+static double LIST_VIEW_H = 490.0;
+static double LIST_CONTENT_H = 552.0;
+static double LIST_SCROLL_MAX = 62.0;
+static int LIST_SCROLL_NEEDED = 1;
 
+/* The bottom controls stay anchored; the list takes whatever height is left
+ * and scrolls when it cannot show every checkout. */
 static void
 layout_update(void)
 {
-    double extra = WIN_H - WIN_H_DESIGN;
-    if (extra < 0.0)
-        extra = 0.0;
-    double grow = extra / (2.0 * REPO_COUNT);
-    ROW_H = 62.0 + grow;
-    ROW_GAP = 8.0 + grow;
-    PROGRESS_Y = LIST_Y + REPO_COUNT * (ROW_H + ROW_GAP) + 12.0;
+    PROGRESS_Y = WIN_H - BOTTOM_RESERVE;
     BUTTON_Y = PROGRESS_Y + PROGRESS_H + 14.0;
+    LIST_VIEW_BOTTOM = PROGRESS_Y - 12.0;
+    LIST_VIEW_H = LIST_VIEW_BOTTOM - LIST_Y;
+    if (LIST_VIEW_H < ROW_H)
+        LIST_VIEW_H = ROW_H;
+
+    LIST_CONTENT_H = REPO_COUNT * ROW_H + (REPO_COUNT - 1) * ROW_GAP;
+    LIST_SCROLL_MAX = LIST_CONTENT_H - LIST_VIEW_H;
+    if (LIST_SCROLL_MAX < 0.0)
+        LIST_SCROLL_MAX = 0.0;
+    LIST_SCROLL_NEEDED = LIST_SCROLL_MAX > 0.5;
+}
+
+/* Width available to a row (the scrollbar reserves a slim right gutter). */
+static double
+list_row_width(void)
+{
+    return WIN_W - MARGIN * 2.0 -
+           (LIST_SCROLL_NEEDED ? SCROLL_GAP + SCROLL_W : 0.0);
+}
+
+static double
+scrollbar_thumb_h(void)
+{
+    if (!LIST_SCROLL_NEEDED || LIST_CONTENT_H <= 0.0)
+        return LIST_VIEW_H;
+    double h = LIST_VIEW_H * LIST_VIEW_H / LIST_CONTENT_H;
+    if (h < SCROLL_MIN_THUMB)
+        h = SCROLL_MIN_THUMB;
+    if (h > LIST_VIEW_H)
+        h = LIST_VIEW_H;
+    return h;
+}
+
+/* Track geometry for the list scrollbar. */
+static void
+scrollbar_geom(double *x, double *y, double *w, double *h)
+{
+    *x = WIN_W - MARGIN - SCROLL_W;
+    *y = LIST_Y;
+    *w = SCROLL_W;
+    *h = LIST_VIEW_H;
+}
+
+static double
+scrollbar_thumb_y(double scroll)
+{
+    double th = scrollbar_thumb_h();
+    double travel = LIST_VIEW_H - th;
+    if (travel <= 0.0 || LIST_SCROLL_MAX <= 0.0)
+        return LIST_Y;
+    return LIST_Y + travel * (scroll / LIST_SCROLL_MAX);
 }
 
 /* Footer sits just inside the bottom edge. */
@@ -687,6 +747,14 @@ struct App {
     int hover_repo;
     int quit;
 
+    /* Repository list scrolling. */
+    double list_scroll;
+    int hover_scrollbar;
+    int drag_scrollbar;
+    double drag_start_y;
+    double drag_start_scroll;
+    int axis_discrete_seen;
+
     double pointer_x, pointer_y;
     double last_draw;
 
@@ -695,6 +763,18 @@ struct App {
     char ctl_buf[256];
     size_t ctl_len;
 };
+
+static void
+list_clamp_scroll(App *a)
+{
+    layout_update();
+    if (a->list_scroll < 0.0)
+        a->list_scroll = 0.0;
+    if (a->list_scroll > LIST_SCROLL_MAX)
+        a->list_scroll = LIST_SCROLL_MAX;
+    if (!LIST_SCROLL_NEEDED)
+        a->list_scroll = 0.0;
+}
 
 /* ------------------------------------------------------------------ */
 /*  Remembered window state                                            */
@@ -2004,6 +2084,9 @@ typedef struct {
     int press_primary;
     int hover_repo;
     double done_t;
+    double scroll;
+    int hover_scrollbar;
+    int drag_scrollbar;
 } View;
 
 #define HERO_CX 96.0
@@ -2346,8 +2429,8 @@ paint_repo_row(cairo_t *cr, const View *v, int i)
 {
     const RepoState *r = &v->s->repos[i];
     double x = MARGIN;
-    double y = LIST_Y + i * (ROW_H + ROW_GAP);
-    double w = WIN_W - MARGIN * 2.0;
+    double y = LIST_Y - v->scroll + i * (ROW_H + ROW_GAP);
+    double w = list_row_width();
     int active = repo_active(r->phase);
     int hover = v->hover_repo == i;
 
@@ -2452,8 +2535,29 @@ paint_repo_list(cairo_t *cr, const View *v)
     text_draw(cr, right, 8.8, 600, C_FAINT, 0.78,
               WIN_W - MARGIN, LIST_LABEL_Y, ALIGN_RIGHT, 1.2);
 
+    cairo_save(cr);
+    cairo_rectangle(cr, MARGIN - 2.0, LIST_Y,
+                    list_row_width() + 4.0, LIST_VIEW_H);
+    cairo_clip(cr);
     for (int i = 0; i < REPO_COUNT; i++)
         paint_repo_row(cr, v, i);
+    cairo_restore(cr);
+
+    if (!LIST_SCROLL_NEEDED)
+        return;
+
+    double sx, sy, sw, sh;
+    scrollbar_geom(&sx, &sy, &sw, &sh);
+    rgba(cr, C_TRACK, 0.85);
+    rounded_rect(cr, sx, sy, sw, sh, sw / 2.0);
+    cairo_fill(cr);
+
+    double th = scrollbar_thumb_h();
+    double ty = scrollbar_thumb_y(v->scroll);
+    int lit = v->hover_scrollbar || v->drag_scrollbar;
+    rgba(cr, lit ? C_ACCENT : C_MUTED, lit ? 0.72 : 0.38);
+    rounded_rect(cr, sx, ty, sw, th, sw / 2.0);
+    cairo_fill(cr);
 }
 
 static void
@@ -2673,15 +2777,28 @@ hit_primary(double x, double y)
 }
 
 static int
-repo_at(double x, double y)
+scrollbar_at(double x, double y)
 {
     layout_update();
+    if (!LIST_SCROLL_NEEDED)
+        return 0;
+    double sx, sy, sw, sh;
+    scrollbar_geom(&sx, &sy, &sw, &sh);
+    return x >= sx - 4.0 && x <= sx + sw + 4.0 &&
+           y >= sy && y <= sy + sh;
+}
+
+static int
+repo_at(App *a, double x, double y)
+{
+    layout_update();
+    list_clamp_scroll(a);
     double x0 = MARGIN;
-    double x1 = WIN_W - MARGIN;
-    if (x < x0 || x > x1)
+    double x1 = MARGIN + list_row_width();
+    if (x < x0 || x > x1 || y < LIST_Y || y > LIST_VIEW_BOTTOM)
         return -1;
     for (int i = 0; i < REPO_COUNT; i++) {
-        double y0 = LIST_Y + i * (ROW_H + ROW_GAP);
+        double y0 = LIST_Y - a->list_scroll + i * (ROW_H + ROW_GAP);
         if (y >= y0 && y <= y0 + ROW_H)
             return i;
     }
@@ -2762,6 +2879,10 @@ update_cursor(App *a)
     uint32_t shape = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_DEFAULT;
     if (a->hover_primary) {
         shape = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_POINTER;
+    } else if (a->drag_scrollbar) {
+        shape = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_GRABBING;
+    } else if (a->hover_scrollbar) {
+        shape = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_NS_RESIZE;
     } else if (a->pointer_x >= 0.0 && a->pointer_y >= 0.0 &&
                a->pointer_y < 58.0) {
         shape = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_GRAB;
@@ -2957,6 +3078,8 @@ app_draw(App *a, const UpdateSnap *s)
     cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
     cairo_scale(cr, a->scale, a->scale);
 
+    list_clamp_scroll(a);
+
     View v;
     memset(&v, 0, sizeof v);
     v.s = s;
@@ -2966,6 +3089,9 @@ app_draw(App *a, const UpdateSnap *s)
     v.press_primary = a->press_primary;
     v.hover_repo = a->hover_repo;
     v.done_t = a->done_t;
+    v.scroll = a->list_scroll;
+    v.hover_scrollbar = a->hover_scrollbar;
+    v.drag_scrollbar = a->drag_scrollbar;
 
     paint_content(cr, &v);
 
@@ -3195,7 +3321,9 @@ pointer_enter(void *data, struct wl_pointer *pointer, uint32_t serial,
     a->pointer_y = wl_fixed_to_double(sy);
     a->cursor_shape = 0;
     a->hover_primary = hit_primary(a->pointer_x, a->pointer_y);
-    a->hover_repo = repo_at(a->pointer_x, a->pointer_y);
+    a->hover_scrollbar = scrollbar_at(a->pointer_x, a->pointer_y);
+    a->hover_repo = a->hover_scrollbar
+                    ? -1 : repo_at(a, a->pointer_x, a->pointer_y);
     a->dirty = 1;
     update_cursor(a);
 }
@@ -3210,7 +3338,9 @@ pointer_leave(void *data, struct wl_pointer *pointer, uint32_t serial,
     a->pointer_y = -1;
     a->hover_primary = 0;
     a->hover_repo = -1;
+    a->hover_scrollbar = 0;
     a->press_primary = 0;
+    a->drag_scrollbar = 0;
     a->dirty = 1;
     update_cursor(a);
 }
@@ -3223,8 +3353,25 @@ pointer_motion(void *data, struct wl_pointer *pointer, uint32_t time,
     App *a = data;
     a->pointer_x = wl_fixed_to_double(sx);
     a->pointer_y = wl_fixed_to_double(sy);
+
+    if (a->drag_scrollbar) {
+        list_clamp_scroll(a);
+        double travel = LIST_VIEW_H - scrollbar_thumb_h();
+        if (travel > 0.0 && LIST_SCROLL_MAX > 0.0)
+            a->list_scroll = a->drag_start_scroll +
+                (a->pointer_y - a->drag_start_y) *
+                (LIST_SCROLL_MAX / travel);
+        list_clamp_scroll(a);
+        a->hover_repo = -1;
+        a->dirty = 1;
+        update_cursor(a);
+        return;
+    }
+
     a->hover_primary = hit_primary(a->pointer_x, a->pointer_y);
-    a->hover_repo = repo_at(a->pointer_x, a->pointer_y);
+    a->hover_scrollbar = scrollbar_at(a->pointer_x, a->pointer_y);
+    a->hover_repo = a->hover_scrollbar
+                    ? -1 : repo_at(a, a->pointer_x, a->pointer_y);
     a->dirty = 1;
     update_cursor(a);
 }
@@ -3242,19 +3389,37 @@ pointer_button(void *data, struct wl_pointer *pointer, uint32_t serial,
     double x = a->pointer_x;
     double y = a->pointer_y;
     a->hover_primary = hit_primary(x, y);
-    a->hover_repo = repo_at(x, y);
+    a->hover_scrollbar = scrollbar_at(x, y);
+    a->hover_repo = a->hover_scrollbar ? -1 : repo_at(a, x, y);
 
     if (state == WL_POINTER_BUTTON_STATE_PRESSED) {
-        if (hit_primary(x, y)) {
+        if (a->hover_scrollbar) {
+            list_clamp_scroll(a);
+            double th = scrollbar_thumb_h();
+            double ty = scrollbar_thumb_y(a->list_scroll);
+            if (y < ty || y > ty + th) {
+                double page = LIST_VIEW_H - th;
+                a->list_scroll += (y < ty) ? -page : page;
+            }
+            list_clamp_scroll(a);
+            a->drag_scrollbar = 1;
+            a->drag_start_y = y;
+            a->drag_start_scroll = a->list_scroll;
+        } else if (hit_primary(x, y)) {
             a->press_primary = 1;
         } else if (y < 58.0) {
             if (a->toplevel && a->seat)
                 xdg_toplevel_move(a->toplevel, a->seat, serial);
         }
-    } else if (a->press_primary) {
-        a->press_primary = 0;
-        if (hit_primary(x, y))
-            toggle_update(a);
+    } else {
+        if (a->drag_scrollbar) {
+            a->drag_scrollbar = 0;
+            list_clamp_scroll(a);
+        } else if (a->press_primary) {
+            a->press_primary = 0;
+            if (hit_primary(x, y))
+                toggle_update(a);
+        }
     }
     a->dirty = 1;
     update_cursor(a);
@@ -3264,13 +3429,23 @@ static void
 pointer_axis(void *data, struct wl_pointer *pointer, uint32_t time,
              uint32_t axis, wl_fixed_t value)
 {
-    (void)data; (void)pointer; (void)time; (void)axis; (void)value;
+    (void)pointer; (void)time;
+    if (axis != WL_POINTER_AXIS_VERTICAL_SCROLL)
+        return;
+    App *a = data;
+    if (a->axis_discrete_seen)
+        return;
+    a->list_scroll += wl_fixed_to_double(value) * 4.0;
+    list_clamp_scroll(a);
+    a->dirty = 1;
 }
 
 static void
 pointer_frame(void *data, struct wl_pointer *pointer)
 {
-    (void)data; (void)pointer;
+    (void)pointer;
+    App *a = data;
+    a->axis_discrete_seen = 0;
 }
 
 static void
@@ -3290,7 +3465,14 @@ static void
 pointer_axis_discrete(void *data, struct wl_pointer *pointer, uint32_t axis,
                       int32_t discrete)
 {
-    (void)data; (void)pointer; (void)axis; (void)discrete;
+    (void)pointer;
+    if (axis != WL_POINTER_AXIS_VERTICAL_SCROLL || discrete == 0)
+        return;
+    App *a = data;
+    a->list_scroll += (double)discrete * 28.0;
+    a->axis_discrete_seen = 1;
+    list_clamp_scroll(a);
+    a->dirty = 1;
 }
 
 static const struct wl_pointer_listener pointer_listener = {
@@ -3546,13 +3728,13 @@ wayland_start(App *a)
     xdg_toplevel_set_title(a->toplevel, "JTLab Updater");
     xdg_toplevel_set_app_id(a->toplevel, "jtupdate");
     xdg_toplevel_set_min_size(a->toplevel, (int)WIN_W_DESIGN,
-                              (int)WIN_H_DESIGN);
+                              (int)WIN_H_MIN);
 
     if (a->state_w > 0 && a->state_h > 0) {
         if (a->state_w < (int)WIN_W_DESIGN)
             a->state_w = (int)WIN_W_DESIGN;
-        if (a->state_h < (int)WIN_H_DESIGN)
-            a->state_h = (int)WIN_H_DESIGN;
+        if (a->state_h < (int)WIN_H_MIN)
+            a->state_h = (int)WIN_H_MIN;
         WIN_W = a->state_w;
         WIN_H = a->state_h;
     }
