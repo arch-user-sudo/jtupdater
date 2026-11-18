@@ -68,7 +68,7 @@
 /* Number of managed repositories. The window grows vertically to show every
  * row without scrolling, so adding a repo only changes this value and the
  * table below. */
-#define REPO_COUNT 7
+#define REPO_COUNT 8
 
 #define WIN_W_DESIGN 760.0
 #define WIN_H_DESIGN 910.0
@@ -370,6 +370,9 @@ static const RepoDef g_repos[REPO_COUNT] = {
       "https://github.com/arch-user-sudo/jtsettings.git",        "make -j2", "make install" },
     { "jtwpi",        "jtwpi",
       "https://github.com/arch-user-sudo/jtwpi.git",        "make -j2", "make install" },
+   { "jtpolkit",        "jtpolkit",
+      "https://github.com/arch-user-sudo/jtpolkit.git",        "make -j2", "make install" },
+
 };
 
 static char g_repo_root[PATH_MAX];
