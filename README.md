@@ -2,7 +2,7 @@
 
 A small Wayland-native repository updater styled like `jtspeedtest` and
 `jtnetworks`. It clones/pulls a set of repos in the background, runs their
-builds, installs everything that changed in one helper pass, and shows per-repo
+builds, installs everything that changed in one elevated pass, and shows per-repo
 and overall progress.
 
 ## Build
@@ -52,29 +52,29 @@ non-git folder is already sitting at a target, it is moved aside as
 
 ## Install
 
-Changed repositories are built first. After the build phase, the updater asks
-`jtupdate-install` to run `make install` in every changed checkout. One helper
-run means one authorization prompt and one `foot`/`footclient` window for the
-whole batch. The helper checks for `doas`, then `sudo`, then `pkexec`.
-If a `doas`/`sudo` timestamp is already cached, no terminal is opened.
+Changed repositories are built first. For the install phase the app requests
+authorization from **Polkit** by re-executing itself through `pkexec` with a
+private install plan. The graphical Polkit agent shows a single dialog, so no
+terminal — and no `doas`/`sudo` password entry — is needed. The elevated
+process runs each checkout's install command and reports the results back to
+the window. There is no separate helper script or second binary.
 
-The helper is installed next to the updater:
+A Polkit authentication agent must be running in your session (most desktops
+start one automatically). `make install` also installs an action at
+`$(PREFIX)/share/polkit-1/actions/com.jtlab.jtupdate.install.policy`, which
+gives the prompt a clear description and keeps the authorization briefly so a
+batch does not ask twice. On systems without `pkexec`, a cached `doas`/`sudo`
+timestamp is used as a silent fallback; that path opens no terminal either.
 
 ```bash
 sudo make install
 ```
 
-That installs `jtupdate`, `jtupdatectl`, and `jtupdate-install` under
-`/usr/local/bin`, plus the matching icon under
-`/usr/local/share/icons/hicolor`. When `jtupdate` is run from its source tree,
-the `jtupdater` install uses that source tree instead of the cached clone, so a
-freshly built updater never replaces itself with an older checkout.
-
-The helper can also be run by hand:
-
-```bash
-jtupdate-install ~/jtupdate/repos/JTLab ~/jtupdate/repos/jtnetworks
-```
+That installs `jtupdate` and `jtupdatectl` under `/usr/local/bin`, the matching
+icon under `/usr/local/share/icons/hicolor`, and the Polkit policy described
+above. When `jtupdate` is run from its source tree, the `jtupdater` install
+uses that source tree instead of the cached clone, so a freshly built updater
+never replaces itself with an older checkout.
 
 ## Controls
 

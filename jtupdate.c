@@ -1014,6 +1014,20 @@ spawn_pipe(char *const argv[], const char *cwd, int *out_fd)
         setenv("GIT_TERMINAL_PROMPT", "0", 1);
         setenv("GIT_ASKPASS", "/bin/false", 1);
 
+        /* A launcher (bar, script, git hook) may export git plumbing vars.
+         * They would make clone/rev-parse act on a different checkout, so
+         * every git command runs against the directory we explicitly chdir
+         * into.  This is what caused "clone finished without a usable
+         * checkout" when the app was started outside a tty. */
+        unsetenv("GIT_DIR");
+        unsetenv("GIT_WORK_TREE");
+        unsetenv("GIT_COMMON_DIR");
+        unsetenv("GIT_INDEX_FILE");
+        unsetenv("GIT_OBJECT_DIRECTORY");
+        unsetenv("GIT_ALTERNATE_OBJECT_DIRECTORIES");
+        unsetenv("GIT_NAMESPACE");
+        unsetenv("GIT_QUARANTINE_PATH");
+
         execvp(argv[0], argv);
         dprintf(STDERR_FILENO, "jtupdate: cannot run %s: %s\n",
                 argv[0], strerror(errno));
@@ -1288,9 +1302,19 @@ clone_checkout(App *a, int i, const RepoDef *def, const char *path,
         usleep(100000);
     }
     if (!repo_is_git(tmp) || !repo_valid(tmp)) {
+        char diag[160] = "";
+        char *dargv[] = { "git", "rev-parse", "HEAD", NULL };
+        run_capture(dargv, tmp, diag, sizeof diag);
+        char *nl = strchr(diag, '\n');
+        if (nl)
+            *nl = '\0';
         rm_rf(tmp);
-        if (err && errn)
-            snprintf(err, errn, "Clone finished without a usable checkout");
+        if (err && errn) {
+            if (diag[0])
+                snprintf(err, errn, "Clone checkout invalid: %s", diag);
+            else
+                snprintf(err, errn, "Clone finished without a usable checkout");
+        }
         return 0;
     }
 
@@ -1362,7 +1386,7 @@ command_exists(const char *name)
     return found;
 }
 
-/* A cached doas/sudo timestamp lets the install run without a terminal. */
+/* A cached doas/sudo timestamp is only a fallback when Polkit is missing. */
 static int
 elevated_cached(const char *tool)
 {
@@ -1383,43 +1407,114 @@ run_build(App *a, int i, const RepoDef *def, const char *path,
     return run_command(a, i, argv, path, RP_BUILDING, p0, p1);
 }
 
-/* The helper installed next to jtupdate performs all of the actual installs.
- * It is also the script that `make install` puts in the updater source tree. */
+/* Absolute path of the running binary.  Elevated installs re-exec this same
+ * program, so there is no separate helper script or second binary. */
 static int
-find_install_helper(char *out, size_t n)
+self_exe_path(char *out, size_t n)
 {
-    char exe[PATH_MAX];
-    ssize_t len = readlink("/proc/self/exe", exe, sizeof exe - 1);
-    if (len > 0) {
-        exe[len] = '\0';
-        char *slash = strrchr(exe, '/');
-        if (slash) {
-            *slash = '\0';
-            const char *names[] = {
-                "jtupdate-install",
-                "jtupdate-install.sh",
-            };
-            for (size_t i = 0; i < sizeof names / sizeof names[0]; i++) {
-                int k = snprintf(out, n, "%s/%s", exe, names[i]);
-                if (k > 0 && (size_t)k < n && access(out, X_OK) == 0)
-                    return 1;
-            }
-        }
+    if (!out || n < 2)
+        return 0;
+    ssize_t len = readlink("/proc/self/exe", out, n - 1);
+    if (len <= 0)
+        return 0;
+    out[len] = '\0';
+    return 1;
+}
+
+/* Run one install command in a checkout, synchronously.  Output is inherited
+ * from the GUI process (pkexec's parent pipe), so make's lines still show up. */
+static int
+run_install_command(char *const argv[], const char *cwd)
+{
+    pid_t pid = fork();
+    if (pid < 0)
+        return 0;
+    if (pid == 0) {
+        if (chdir(cwd) < 0)
+            _exit(127);
+        execvp(argv[0], argv);
+        _exit(127);
+    }
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR)
+        ;
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
+/* Privileged entry point.  Every line of the plan is a checkout to install;
+ * one status file per line is written for the unprivileged GUI process. */
+static int
+run_privileged_install(const char *plan, const char *statusdir,
+                       const char *home)
+{
+    if (geteuid() != 0) {
+        fprintf(stderr, "jtupdate: install mode requires root\n");
+        return 1;
+    }
+    /* pkexec resets HOME to root's; restore the invoking user's home so
+     * repositories that install dotfiles still target the right account. */
+    if (home && home[0])
+        setenv("HOME", home, 1);
+
+    FILE *f = fopen(plan, "r");
+    if (!f) {
+        fprintf(stderr, "jtupdate: cannot read install plan: %s\n", plan);
+        return 1;
+    }
+    if (statusdir && !mkdir_p(statusdir)) {
+        fprintf(stderr, "jtupdate: cannot create status directory: %s\n",
+                statusdir);
+        fclose(f);
+        return 1;
     }
 
-    const char *home = getenv("HOME");
-    if (home && *home) {
-        const char *paths[] = {
-            "%s/jtupdate/jtupdate-install.sh",
-            "%s/git/jtupdater/jtupdate-install.sh",
-        };
-        for (size_t i = 0; i < sizeof paths / sizeof paths[0]; i++) {
-            int k = snprintf(out, n, paths[i], home);
-            if (k > 0 && (size_t)k < n && access(out, X_OK) == 0)
-                return 1;
+    int overall = 0;
+    int n = 0;
+    char line[PATH_MAX];
+    while (fgets(line, sizeof line, f)) {
+        size_t len = strlen(line);
+        while (len && (line[len - 1] == '\n' || line[len - 1] == '\r'))
+            line[--len] = '\0';
+        if (!len)
+            continue;
+
+        const char *slash = strrchr(line, '/');
+        const char *slug = slash ? slash + 1 : line;
+        const char *cmd = "make install";
+        for (int i = 0; i < REPO_COUNT; i++) {
+            if (!strcmp(g_repos[i].slug, slug)) {
+                if (g_repos[i].install && g_repos[i].install[0])
+                    cmd = g_repos[i].install;
+                break;
+            }
         }
+
+        char cmdbuf[256];
+        snprintf(cmdbuf, sizeof cmdbuf, "%s", cmd);
+        char *av[16];
+        int ac = 0;
+        for (char *tok = strtok(cmdbuf, " \t");
+             tok && ac < (int)(sizeof av / sizeof av[0]) - 1;
+             tok = strtok(NULL, " \t"))
+            av[ac++] = tok;
+        av[ac] = NULL;
+
+        int ok = ac > 0 && run_install_command(av, line);
+        if (statusdir) {
+            char sf[PATH_MAX];
+            snprintf(sf, sizeof sf, "%s/%d.status", statusdir, n);
+            FILE *s = fopen(sf, "w");
+            if (s) {
+                fprintf(s, "%d\n", ok ? 0 : 1);
+                fclose(s);
+            }
+        }
+        if (!ok)
+            overall = 1;
+        n++;
     }
-    return 0;
+    fclose(f);
+    return overall;
 }
 
 /* When jtupdate is running from its source tree, install that tree instead of
@@ -1452,14 +1547,21 @@ find_self_source_dir(char *out, size_t n)
     return 1;
 }
 
-/* "" means we are root.  "doas"/"sudo" means that tool has a cached
- * timestamp, so the helper can run without a terminal.  NULL means the helper
- * must be started in a terminal so it can authenticate. */
+/* Elevation used for the shared install pass.
+ *
+ * ""             already root — install directly in this process.
+ * "pkexec"       use Polkit.  The session's authentication agent shows the
+ *                prompt, so neither a terminal nor doas/sudo is involved.
+ * "doas"/"sudo"  a cached timestamp exists; also needs no terminal.
+ * NULL           no usable elevation mechanism is installed.
+ */
 static const char *
-cached_elevation(void)
+install_elevation(void)
 {
     if (geteuid() == 0)
         return "";
+    if (command_exists("pkexec"))
+        return "pkexec";
     if (command_exists("doas") && elevated_cached("doas"))
         return "doas";
     if (command_exists("sudo") && elevated_cached("sudo"))
@@ -1482,23 +1584,23 @@ remove_install_temp(const char *plan, const char *statusdir, int count)
     }
 }
 
-/* Run one helper for every queued repository.  The helper checks doas, sudo,
- * then pkexec and re-executes itself once, so all installs share one
- * authorization prompt and one terminal window.
- * Per-repo exit codes are read back from status files. */
+/* Install every queued checkout in one elevated pass.  The GUI process asks
+ * Polkit for authorization by re-executing itself through pkexec; the root
+ * process runs the per-repo install commands and reports back via status
+ * files.  No terminal and no external helper script are involved. */
 static int
-run_helper_installs(App *a, const int *idxs, const int *cloned, int count,
-                    const char *elev)
+run_installs(App *a, const int *idxs, const int *cloned, int count,
+             const char *elev)
 {
     UpdateState *st = &a->upd;
     if (count <= 0)
         return 1;
 
-    char helper[PATH_MAX];
-    if (!find_install_helper(helper, sizeof helper)) {
+    char self[PATH_MAX];
+    if (!self_exe_path(self, sizeof self)) {
         for (int p = 0; p < count; p++)
             finish_repo(st, idxs[p], RP_ERROR,
-                        "Install helper missing — run make install");
+                        "Cannot locate the jtupdate binary");
         return 0;
     }
 
@@ -1543,55 +1645,61 @@ run_helper_installs(App *a, const int *idxs, const int *cloned, int count,
         snprintf(status, sizeof status, "%s/%d.status", statusdir, p);
         unlink(status);
         repo_update(st, idxs[p], RP_INSTALL, 0.90,
-                    "Waiting for authorization");
+                    "Waiting for authentication");
     }
-
-    const char *term = NULL;
-    if (command_exists("foot"))
-        term = "foot";
-    else if (command_exists("footclient"))
-        term = "footclient";
 
     char *argv[12];
     int ai = 0;
-    int terminal = 0;
+    int use_polkit = 0;
+    int elevated = 0;
 
     if (elev && !elev[0]) {
-        argv[ai++] = helper;
+        /* Already root: install in this process without re-executing. */
+        elevated = 1;
+    } else if (elev && !strcmp(elev, "pkexec")) {
+        /* pkexec delegates the prompt to the graphical polkit agent. */
+        argv[ai++] = (char *)elev;
+        argv[ai++] = self;
+        argv[ai++] = "--install-plan";
+        argv[ai++] = plan;
+        argv[ai++] = "--status-dir";
+        argv[ai++] = statusdir;
+        argv[ai++] = "--home";
+        argv[ai++] = (char *)(getenv("HOME") ? getenv("HOME") : "");
+        use_polkit = 1;
     } else if (elev) {
         argv[ai++] = (char *)elev;
         argv[ai++] = "-n";
-        argv[ai++] = helper;
+        argv[ai++] = self;
+        argv[ai++] = "--install-plan";
+        argv[ai++] = plan;
+        argv[ai++] = "--status-dir";
+        argv[ai++] = statusdir;
+        argv[ai++] = "--home";
+        argv[ai++] = (char *)(getenv("HOME") ? getenv("HOME") : "");
     } else {
-        if (!term) {
-            remove_install_temp(plan, statusdir, count);
-            for (int p = 0; p < count; p++)
-                finish_repo(st, idxs[p], RP_ERROR,
-                            "Install needs doas/sudo and a terminal");
-            return 0;
-        }
-        argv[ai++] = (char *)term;
-        argv[ai++] = "-T";
-        argv[ai++] = "jtupdate install";
-        argv[ai++] = helper;
-        terminal = 1;
+        remove_install_temp(plan, statusdir, count);
+        for (int p = 0; p < count; p++)
+            finish_repo(st, idxs[p], RP_ERROR,
+                        "Install needs Polkit (pkexec)");
+        return 0;
     }
-    argv[ai++] = "--plan";
-    argv[ai++] = plan;
-    argv[ai++] = "--status-dir";
-    argv[ai++] = statusdir;
     argv[ai] = NULL;
 
-    if (terminal)
-        state_set_status(st, "Installing %d repositories — authorize in "
-                         "the terminal…", count);
+    if (use_polkit)
+        state_set_status(st, "Installing %d repositories — approve the "
+                         "Polkit dialog…", count);
     else
         state_set_status(st, "Installing %d repositories…", count);
 
     for (int p = 0; p < count; p++)
         repo_update(st, idxs[p], RP_INSTALL, 0.92, "Installing binaries…");
 
-    int rc = run_command(a, idxs[0], argv, NULL, RP_INSTALL, 0.92, 1.0);
+    int rc;
+    if (elevated)
+        rc = run_privileged_install(plan, statusdir, getenv("HOME")) ? 1 : 0;
+    else
+        rc = run_command(a, idxs[0], argv, NULL, RP_INSTALL, 0.92, 1.0);
     if (rc < 0) {
         remove_install_temp(plan, statusdir, count);
         for (int p = 0; p < count; p++)
@@ -1617,14 +1725,16 @@ run_helper_installs(App *a, const int *idxs, const int *cloned, int count,
                         ? "Cloned, built and installed"
                         : "Pulled, built and installed");
         } else {
-            finish_repo(st, i, RP_ERROR, "Install failed");
+            finish_repo(st, i, RP_ERROR, use_polkit
+                        ? "Install failed — Polkit denied or no agent running"
+                        : "Install failed");
         }
     }
     remove_install_temp(plan, statusdir, count);
     return 1;
 }
 
-/* Queue a changed repository for the shared install helper. */
+/* Queue a changed repository for the shared elevated install pass. */
 static int
 finish_after_build(App *a, int i, const RepoDef *def, int cloned,
                    int *pending, int *pending_cloned, int *pending_count)
@@ -1754,8 +1864,8 @@ update_worker(void *arg)
             goto out;
     }
 
-    if (run_helper_installs(a, pending, pending_cloned, pending_count,
-                            cached_elevation()) < 0) {
+    if (run_installs(a, pending, pending_cloned, pending_count,
+                     install_elevation()) < 0) {
         pending_count = 0;
         goto out;
     }
@@ -3892,6 +4002,30 @@ write_screenshot(const char *path)
 int
 main(int argc, char **argv)
 {
+    /* Internal elevated mode: pkexec re-runs this same binary with a plan of
+     * checkouts to install.  It never touches Wayland or the control socket. */
+    if (argc >= 2 && !strcmp(argv[1], "--install-plan")) {
+        const char *plan = argc >= 3 ? argv[2] : NULL;
+        const char *statusdir = NULL;
+        const char *home = NULL;
+        for (int i = 3; i < argc; i++) {
+            if (!strcmp(argv[i], "--status-dir") && i + 1 < argc)
+                statusdir = argv[++i];
+            else if (!strncmp(argv[i], "--status-dir=", 13))
+                statusdir = argv[i] + 13;
+            else if (!strcmp(argv[i], "--home") && i + 1 < argc)
+                home = argv[++i];
+            else if (!strncmp(argv[i], "--home=", 7))
+                home = argv[i] + 7;
+        }
+        if (!plan || !plan[0]) {
+            fprintf(stderr, "usage: %s --install-plan FILE "
+                            "[--status-dir DIR] [--home DIR]\n", argv[0]);
+            return 2;
+        }
+        return run_privileged_install(plan, statusdir, home);
+    }
+
     const char *base_dir = NULL;
     if (!base_dir_cli(&argc, argv, &base_dir))
         return 2;
