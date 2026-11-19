@@ -1828,15 +1828,6 @@ finish_after_build(App *a, int i, const RepoDef *def, int cloned,
         return 1;
     }
 
-    if (cloned && strcmp(def->slug, "jtupdater") == 0) {
-        char self_source[PATH_MAX];
-        if (!find_self_source_dir(self_source, sizeof self_source)) {
-            finish_repo(&a->upd, i, RP_DONE,
-                        "Cloned and built — install manually");
-            return 1;
-        }
-    }
-
     pending[*pending_count] = i;
     pending_cloned[*pending_count] = cloned;
     (*pending_count)++;
