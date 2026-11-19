@@ -4274,6 +4274,12 @@ main(int argc, char **argv)
         return 1;
     }
 
+    /*
+     * Some launchers ignore SIGCHLD to auto-reap their own children.
+     * Inherited across exec, this breaks waitpid()/system()/popen() with
+     * ECHILD, so reset to default for jtupdate's own subprocess handling.
+     */
+    signal(SIGCHLD, SIG_DFL);
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
     signal(SIGPIPE, SIG_IGN);
