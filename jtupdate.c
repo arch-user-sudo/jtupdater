@@ -741,7 +741,10 @@ struct App {
     int worker_alive;
 
     double t0;
+    double anim_t;        /* visual clock advanced by wl_surface.frame */
+    double anim_last;     /* monotonic time of the last frame step */
     double disp;
+    double disp_target;   /* latest progress target from the updater state */
     double done_t;
     UpdatePhase prev_phase;
 
@@ -3038,8 +3041,23 @@ frame_done(void *data, struct wl_callback *cb, uint32_t time)
 {
     (void)time;
     App *a = data;
+    if (a->frame_cb == cb) a->frame_cb = NULL;
     wl_callback_destroy(cb);
-    a->frame_cb = NULL;
+
+    double now = mono_sec();
+    double dt = now - a->anim_last;
+    a->anim_last = now;
+    if (dt < 0.0) dt = 0.0;
+    if (dt > 0.12) dt = 0.12;
+    a->anim_t += dt;
+
+    double k = 1.0 - exp(-dt * 5.0);
+    a->disp += (a->disp_target - a->disp) * k;
+    if (fabs(a->disp_target - a->disp) < 0.001)
+        a->disp = a->disp_target;
+
+    /* Ambient motion runs continuously; keep requesting frames. */
+    a->dirty = 1;
 }
 
 static const struct wl_callback_listener frame_listener = {
@@ -3089,7 +3107,7 @@ app_draw(App *a, const UpdateSnap *s)
     View v;
     memset(&v, 0, sizeof v);
     v.s = s;
-    v.t = mono_sec() - a->t0;
+    v.t = a->anim_t;
     v.disp = a->disp;
     v.hover_primary = a->hover_primary;
     v.press_primary = a->press_primary;
@@ -4310,7 +4328,8 @@ main(int argc, char **argv)
     ctl_start(&a);
 
     a.t0 = mono_sec();
-    double last = mono_sec();
+    a.anim_t = 0.0;
+    a.anim_last = a.t0;
     UpdateSnap prev_snap;
     memset(&prev_snap, 0, sizeof prev_snap);
 
@@ -4327,23 +4346,16 @@ main(int argc, char **argv)
         }
 
         double now = mono_sec();
-        double dt = now - last;
-        if (dt > 0.12) dt = 0.12;
-        if (dt < 0.0) dt = 0.0;
-        last = now;
 
         if (s.phase != a.prev_phase) {
             if (s.phase == UP_DONE || s.phase == UP_ERROR ||
                 s.phase == UP_CANCELLED)
-                a.done_t = now - a.t0;
+                a.done_t = a.anim_t;
             a.prev_phase = s.phase;
         }
 
-        double target = s.progress;
-        double k = 1.0 - exp(-dt * 5.0);
-        a.disp += (target - a.disp) * k;
-        if (fabs(target - a.disp) < 0.001)
-            a.disp = target;
+        /* frame_done() eases disp toward this target on the frame clock. */
+        a.disp_target = s.progress;
 
         double interval = s.running ? 1.0 / 60.0 : 1.0 / 30.0;
         int due = a.dirty || now - a.last_draw >= interval;
