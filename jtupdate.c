@@ -1993,11 +1993,23 @@ font_get(double size, int weight)
     return fd;
 }
 
+/* Explicit Pango font options override anything derived from the target
+ * surface, so every glyph renders without antialiasing. */
+static void
+font_antialias_off(PangoLayout *layout)
+{
+    cairo_font_options_t *opts = cairo_font_options_create();
+    cairo_font_options_set_antialias(opts, CAIRO_ANTIALIAS_NONE);
+    pango_cairo_context_set_font_options(pango_layout_get_context(layout), opts);
+    cairo_font_options_destroy(opts);
+}
+
 static PangoLayout *
 layout_make(cairo_t *cr, const char *text, double size, int weight,
             double spacing)
 {
     PangoLayout *l = pango_cairo_create_layout(cr);
+    font_antialias_off(l);
     pango_layout_set_font_description(l, font_get(size, weight));
     pango_layout_set_text(l, text, -1);
 
@@ -3191,9 +3203,15 @@ toplevel_configure(void *data, struct xdg_toplevel *t,
             fullscreen = 1;
     }
 
+    int was_maximized = a->state_maximized;
     a->state_maximized = maximized;
 
-    if (width > 0 && height > 0) {
+    if (!maximized && !fullscreen && was_maximized &&
+        a->state_w > 0 && a->state_h > 0) {
+        /* Leaving maximized: reapply the size saved before maximizing. */
+        WIN_W = a->state_w;
+        WIN_H = a->state_h;
+    } else if (width > 0 && height > 0) {
         WIN_W = width;
         WIN_H = height;
         if (!maximized && !fullscreen) {
@@ -3201,6 +3219,9 @@ toplevel_configure(void *data, struct xdg_toplevel *t,
             a->state_h = height;
         }
     }
+    if (a->xdg_surface)
+        xdg_surface_set_window_geometry(a->xdg_surface, 0, 0,
+                                        (int)WIN_W, (int)WIN_H);
     a->dirty = 1;
 }
 
@@ -3732,6 +3753,8 @@ wayland_start(App *a)
         WIN_W = a->state_w;
         WIN_H = a->state_h;
     }
+    xdg_surface_set_window_geometry(a->xdg_surface, 0, 0,
+                                    (int)WIN_W, (int)WIN_H);
     if (a->state_maximized)
         xdg_toplevel_set_maximized(a->toplevel);
 
