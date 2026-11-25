@@ -68,7 +68,7 @@
 
 /* Number of managed repositories. The list scrolls, so the window no longer
  * has to grow to fit every row. */
-#define REPO_COUNT 9
+#define REPO_COUNT 10
 
 #define WIN_W_DESIGN 760.0
 #define WIN_H_DESIGN 910.0
@@ -434,6 +434,9 @@ static const RepoDef g_repos[REPO_COUNT] = {
       "https://github.com/arch-user-sudo/jtpolkit.git",        "make -j2", "make install" },
 	{ "jtgreeter",        "jtgreeter",
       "https://github.com/arch-user-sudo/jtgreeter.git",        "make -j2", "make install" },
+	{ "jtfiles",        "jtfiles",
+      "https://github.com/arch-user-sudo/jtfiles.git",        "make -j2", "make install" },
+
 
 
 };
