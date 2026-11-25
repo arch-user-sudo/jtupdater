@@ -646,6 +646,10 @@ typedef struct {
     double progress;
     int updated;
     char detail[160];
+    /* Relevant build lines are kept so the failure window can name missing
+     * libraries instead of replacing them with a generic "Build failed". */
+    char missing[320];
+    char build_error[1024];
 } RepoState;
 
 typedef struct {
@@ -659,6 +663,9 @@ typedef struct {
     int current_count;
     int error_count;
     int skipped_count;
+    int failure_open;
+    int failure_repo;
+    unsigned failure_seq;
     char status[192];
     RepoState repos[REPO_COUNT];
 } UpdateState;
@@ -672,6 +679,9 @@ typedef struct {
     int current_count;
     int error_count;
     int skipped_count;
+    int failure_open;
+    int failure_repo;
+    unsigned failure_seq;
     char status[192];
     RepoState repos[REPO_COUNT];
 } UpdateSnap;
@@ -754,6 +764,10 @@ struct App {
     int hover_primary;
     int press_primary;
     int hover_repo;
+    int hover_failure_close;
+    int press_failure_close;
+    unsigned failure_view_seq;
+    double failure_scroll;
     int quit;
 
     /* Repository list scrolling. */
@@ -884,6 +898,150 @@ trim_ws(char *s)
         s[--n] = '\0';
 }
 
+/* ------------------------------------------------------------------ */
+/*  Pending-build cache                                                */
+/* ------------------------------------------------------------------ */
+
+typedef enum {
+    BUILD_CACHE_NONE = 0,
+    BUILD_CACHE_FAILED = 1,
+    BUILD_CACHE_CANCELLED = 2
+} BuildCacheState;
+
+/* Projects whose build did not complete successfully.  They are retried even
+ * when HEAD has not moved, so installing a missing dependency — or simply
+ * letting a cancelled compile run again — clears the entry. */
+static int g_build_cache[REPO_COUNT];
+static pthread_mutex_t g_build_cache_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static int
+build_cache_path(char *out, size_t n)
+{
+    const char *home = getenv("HOME");
+    if (!home || !*home || !out || n < 2)
+        return 0;
+    snprintf(out, n, "%s/.cache/jt/jtupdate", home);
+    return 1;
+}
+
+static void
+build_cache_save_locked(void)
+{
+    char path[512];
+    if (!build_cache_path(path, sizeof path))
+        return;
+
+    int any = 0;
+    for (int i = 0; i < REPO_COUNT; i++) {
+        if (g_build_cache[i] != BUILD_CACHE_NONE) {
+            any = 1;
+            break;
+        }
+    }
+
+    if (!any) {
+        unlink(path);
+        return;
+    }
+
+    char dir[512];
+    snprintf(dir, sizeof dir, "%s", path);
+    char *slash = strrchr(dir, '/');
+    if (slash) {
+        *slash = '\0';
+        mkdir_p(dir);
+    }
+
+    char tmp[600];
+    snprintf(tmp, sizeof tmp, "%s.tmp-%ld", path, (long)getpid());
+    FILE *f = fopen(tmp, "w");
+    if (!f)
+        return;
+    for (int i = 0; i < REPO_COUNT; i++) {
+        if (g_build_cache[i] == BUILD_CACHE_CANCELLED)
+            fprintf(f, "%s\tcancelled\n", g_repos[i].slug);
+        else if (g_build_cache[i] == BUILD_CACHE_FAILED)
+            fprintf(f, "%s\n", g_repos[i].slug);
+    }
+    fclose(f);
+
+    if (rename(tmp, path) < 0)
+        unlink(tmp);
+}
+
+static void
+build_cache_load(void)
+{
+    pthread_mutex_lock(&g_build_cache_lock);
+    memset(g_build_cache, 0, sizeof g_build_cache);
+
+    char path[512];
+    if (build_cache_path(path, sizeof path)) {
+        FILE *f = fopen(path, "r");
+        if (f) {
+            char line[256];
+            while (fgets(line, sizeof line, f)) {
+                char slug[128];
+                char reason[32] = "";
+                int fields = sscanf(line, " %127s %31s", slug, reason);
+                if (fields < 1)
+                    continue;
+                for (int i = 0; i < REPO_COUNT; i++) {
+                    if (!strcmp(g_repos[i].slug, slug)) {
+                        g_build_cache[i] =
+                            !strcasecmp(reason, "cancelled")
+                                ? BUILD_CACHE_CANCELLED
+                                : BUILD_CACHE_FAILED;
+                        break;
+                    }
+                }
+            }
+            fclose(f);
+        }
+    }
+    pthread_mutex_unlock(&g_build_cache_lock);
+}
+
+static int
+build_cache_state(int i)
+{
+    if (i < 0 || i >= REPO_COUNT)
+        return BUILD_CACHE_NONE;
+    pthread_mutex_lock(&g_build_cache_lock);
+    int state = g_build_cache[i];
+    pthread_mutex_unlock(&g_build_cache_lock);
+    return state;
+}
+
+static int
+build_cache_has(int i)
+{
+    return build_cache_state(i) != BUILD_CACHE_NONE;
+}
+
+static void
+build_cache_set(int i, BuildCacheState state)
+{
+    if (i < 0 || i >= REPO_COUNT)
+        return;
+    pthread_mutex_lock(&g_build_cache_lock);
+    g_build_cache[i] = state;
+    build_cache_save_locked();
+    pthread_mutex_unlock(&g_build_cache_lock);
+}
+
+static void
+build_cache_set_failed(int i, int failed)
+{
+    build_cache_set(i, failed ? BUILD_CACHE_FAILED : BUILD_CACHE_NONE);
+}
+
+static void
+build_cache_set_cancelled(int i)
+{
+    build_cache_set(i, BUILD_CACHE_CANCELLED);
+}
+
 static void
 state_init(UpdateState *st)
 {
@@ -892,12 +1050,24 @@ state_init(UpdateState *st)
     st->phase = UP_IDLE;
     st->current = -1;
     st->progress = 0.0;
+    st->failure_repo = -1;
     snprintf(st->status, sizeof st->status, "Ready to check for updates.");
     for (int i = 0; i < REPO_COUNT; i++) {
         st->repos[i].phase = RP_QUEUED;
         st->repos[i].progress = 0.0;
-        snprintf(st->repos[i].detail, sizeof st->repos[i].detail,
-                 "%s", g_repo_short[i]);
+        st->repos[i].missing[0] = '\0';
+        st->repos[i].build_error[0] = '\0';
+        int cached = build_cache_state(i);
+        if (cached == BUILD_CACHE_CANCELLED)
+            snprintf(st->repos[i].detail, sizeof st->repos[i].detail,
+                     "%.108s — compile cancelled; retry pending",
+                     g_repo_short[i]);
+        else if (cached == BUILD_CACHE_FAILED)
+            snprintf(st->repos[i].detail, sizeof st->repos[i].detail,
+                     "%.112s — build retry pending", g_repo_short[i]);
+        else
+            snprintf(st->repos[i].detail, sizeof st->repos[i].detail,
+                     "%s", g_repo_short[i]);
     }
 }
 
@@ -930,6 +1100,238 @@ repo_update(UpdateState *st, int i, RepoPhase phase, double progress,
     if (detail)
         snprintf(r->detail, sizeof r->detail, "%s", detail);
     st->progress = ((double)i + progress) / (double)REPO_COUNT;
+    pthread_mutex_unlock(&st->lock);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Build diagnostics                                                  */
+/* ------------------------------------------------------------------ */
+
+static int
+missing_has_name(const char *list, const char *name)
+{
+    size_t n = strlen(name);
+    const char *p = list;
+    for (;;) {
+        const char *end = strchr(p, ',');
+        if (!end)
+            end = p + strlen(p);
+        const char *start = p;
+        while (start < end && *start == ' ')
+            start++;
+        while (end > start && end[-1] == ' ')
+            end--;
+        if ((size_t)(end - start) == n &&
+            !strncasecmp(start, name, n))
+            return 1;
+        if (!*end)
+            return 0;
+        p = end + 1;
+    }
+}
+
+static void
+append_missing_name(RepoState *r, const char *p, size_t len)
+{
+    char token[160];
+    if (!p || len == 0 || len >= sizeof token)
+        return;
+
+    memcpy(token, p, len);
+    token[len] = '\0';
+    trim_ws(token);
+
+    char *end = token + strlen(token);
+    while (end > token && (*(end - 1) == '.' || *(end - 1) == ',' ||
+                           *(end - 1) == ')' || *(end - 1) == '(' ||
+                           *(end - 1) == ':' || *(end - 1) == ';'))
+        *--end = '\0';
+    if (!token[0])
+        return;
+
+    char *name = token;
+    while (*name == ' ')
+        name++;
+    if (!*name)
+        return;
+    if (missing_has_name(r->missing, name))
+        return;
+
+    size_t used = strlen(r->missing);
+    size_t add = strlen(name);
+    if (used + (used ? 2 : 0) + add >= sizeof r->missing)
+        return;
+    if (used)
+        strcat(r->missing, ", ");
+    strcat(r->missing, name);
+}
+
+static void
+missing_from_line(RepoState *r, const char *line)
+{
+    const char *p = strcasestr(line, "Package '");
+    if (p && strcasestr(line, "not found")) {
+        p += 9;
+        const char *q = strchr(p, '\'');
+        if (q && q > p)
+            append_missing_name(r, p, (size_t)(q - p));
+    }
+
+    p = strcasestr(line, "No package '");
+    if (p) {
+        p += 12;
+        const char *q = strchr(p, '\'');
+        if (q && q > p)
+            append_missing_name(r, p, (size_t)(q - p));
+    }
+
+    p = strcasestr(line, "cannot find -l");
+    if (p) {
+        p += 14;
+        const char *q = p;
+        while (*q && (isalnum((unsigned char)*q) || *q == '_' ||
+                      *q == '-' || *q == '+' || *q == '.'))
+            q++;
+        append_missing_name(r, p, (size_t)(q - p));
+    }
+
+    p = strcasestr(line, "Could NOT find");
+    if (!p)
+        p = strcasestr(line, "Could not find");
+    if (p) {
+        p += 14;
+        while (*p == ' ' || *p == '\t')
+            p++;
+        const char *q = strchr(p, '"');
+        if (q && strchr(q + 1, '"')) {
+            const char *end = strchr(q + 1, '"');
+            append_missing_name(r, q + 1, (size_t)(end - (q + 1)));
+        } else {
+            q = p;
+            while (*q && !isspace((unsigned char)*q) && *q != '(' &&
+                   *q != ')' && *q != ',' && *q != ':')
+                q++;
+            size_t word = (size_t)(q - p);
+            int article = (word == 1 && tolower((unsigned char)*p) == 'a') ||
+                          (word == 3 && !strncasecmp(p, "the", 3));
+            /* CMake's "Could NOT find PkgConfig" refers to the pkg-config
+             * tool, not a library with that name. */
+            int cmake_tool = word == 9 &&
+                             !strncasecmp(p, "PkgConfig", 9);
+            if (word && !article && !cmake_tool)
+                append_missing_name(r, p, word);
+        }
+    }
+
+    if (strcasestr(line, "fatal error:") &&
+        strcasestr(line, "No such file or directory")) {
+        p = strcasestr(line, "fatal error:");
+        p += 12;
+        while (*p == ' ' || *p == '\t')
+            p++;
+        const char *q = strchr(p, ':');
+        if (!q)
+            q = p + strlen(p);
+        char header[180];
+        snprintf(header, sizeof header, "header: %.*s", (int)(q - p), p);
+        append_missing_name(r, header, strlen(header));
+    }
+}
+
+static int
+diagnostic_line_interesting(const char *line)
+{
+    static const char *const needles[] = {
+        "not found", "no package", "no such file or directory",
+        "cannot find", "could not find", "could not locate",
+        "undefined reference",
+        "fatal error:", "error:", "no rule to make target",
+        "ld returned", "pkg-config"
+    };
+    for (size_t i = 0; i < sizeof needles / sizeof needles[0]; i++) {
+        if (strcasestr(line, needles[i]))
+            return 1;
+    }
+    return 0;
+}
+
+static void
+diagnostic_append(UpdateState *st, int i, const char *raw)
+{
+    if (i < 0 || i >= REPO_COUNT || !raw || !*raw)
+        return;
+
+    char line[180];
+    snprintf(line, sizeof line, "%s", raw);
+    trim_ws(line);
+    if (!line[0] || !diagnostic_line_interesting(line))
+        return;
+
+    pthread_mutex_lock(&st->lock);
+    RepoState *r = &st->repos[i];
+    missing_from_line(r, line);
+
+    size_t used = strlen(r->build_error);
+    size_t add = strlen(line);
+    if (used + add + 2 < sizeof r->build_error) {
+        if (used)
+            snprintf(r->build_error + used, sizeof r->build_error - used,
+                     "\n%s", line);
+        else
+            snprintf(r->build_error, sizeof r->build_error, "%s", line);
+    }
+    pthread_mutex_unlock(&st->lock);
+}
+
+static void
+repo_clear_build_diag(UpdateState *st, int i)
+{
+    if (i < 0 || i >= REPO_COUNT)
+        return;
+    pthread_mutex_lock(&st->lock);
+    st->repos[i].missing[0] = '\0';
+    st->repos[i].build_error[0] = '\0';
+    pthread_mutex_unlock(&st->lock);
+}
+
+static void
+state_show_build_failure(UpdateState *st, int i)
+{
+    if (i < 0 || i >= REPO_COUNT)
+        return;
+    pthread_mutex_lock(&st->lock);
+    st->failure_open = 1;
+    st->failure_repo = i;
+    st->failure_seq++;
+    if (st->failure_seq == 0)
+        st->failure_seq = 1;
+    pthread_mutex_unlock(&st->lock);
+}
+
+static void
+repo_build_failure_detail(UpdateState *st, int i, char *out, size_t n)
+{
+    if (!out || n == 0)
+        return;
+    if (i < 0 || i >= REPO_COUNT) {
+        snprintf(out, n, "Build failed");
+        return;
+    }
+
+    pthread_mutex_lock(&st->lock);
+    const RepoState *r = &st->repos[i];
+    if (r->missing[0]) {
+        snprintf(out, n, "Missing: %s", r->missing);
+    } else if (r->build_error[0]) {
+        char first[180];
+        snprintf(first, sizeof first, "%.179s", r->build_error);
+        char *nl = strchr(first, '\n');
+        if (nl)
+            *nl = '\0';
+        snprintf(out, n, "Build failed: %s", first);
+    } else {
+        snprintf(out, n, "Build failed — no diagnostics captured");
+    }
     pthread_mutex_unlock(&st->lock);
 }
 
@@ -979,6 +1381,10 @@ state_begin(UpdateState *st)
     st->current_count = 0;
     st->error_count = 0;
     st->skipped_count = 0;
+    st->failure_open = 0;
+    st->failure_repo = -1;
+    /* Keep the sequence monotonic across runs: a stale UI view sequence must
+     * never match a dialog opened by a later update. */
     snprintf(st->status, sizeof st->status, "Checking repositories…");
 
     for (int i = 0; i < REPO_COUNT; i++) {
@@ -986,6 +1392,8 @@ state_begin(UpdateState *st)
         r->phase = RP_QUEUED;
         r->progress = 0.0;
         r->updated = 0;
+        r->missing[0] = '\0';
+        r->build_error[0] = '\0';
         if (!g_repos[i].url[0] && !repo_is_git(g_repo_path[i]))
             snprintf(r->detail, sizeof r->detail,
                      "Add the repository URL in jtupdate.c");
@@ -1065,6 +1473,9 @@ state_snapshot(UpdateState *st, UpdateSnap *s)
     s->current_count = st->current_count;
     s->error_count = st->error_count;
     s->skipped_count = st->skipped_count;
+    s->failure_open = st->failure_open;
+    s->failure_repo = st->failure_repo;
+    s->failure_seq = st->failure_seq;
     snprintf(s->status, sizeof s->status, "%s", st->status);
     for (int i = 0; i < REPO_COUNT; i++)
         s->repos[i] = st->repos[i];
@@ -1306,6 +1717,8 @@ run_command(App *a, int idx, char *const argv[], const char *cwd,
                         line[line_len] = '\0';
                         command_line(st, idx, phase, line,
                                      p0, p1, &progress);
+                        if (phase == RP_BUILDING)
+                            diagnostic_append(st, idx, line);
                         line_len = 0;
                     }
                 } else if (line_len + 1 < sizeof line) {
@@ -1322,6 +1735,8 @@ run_command(App *a, int idx, char *const argv[], const char *cwd,
     if (line_len > 0) {
         line[line_len] = '\0';
         command_line(st, idx, phase, line, p0, p1, &progress);
+        if (phase == RP_BUILDING)
+            diagnostic_append(st, idx, line);
     }
     close(fd);
 
@@ -1491,12 +1906,29 @@ static int
 run_build(App *a, int i, const RepoDef *def, const char *path,
           double p0, double p1)
 {
-    if (!def->build || !def->build[0])
+    if (!def->build || !def->build[0]) {
+        repo_clear_build_diag(&a->upd, i);
         return 1;
+    }
     state_set_status(&a->upd, "Building %s…", def->name);
     repo_update(&a->upd, i, RP_BUILDING, p0, "Running the build…");
     char *argv[] = { "/bin/sh", "-c", (char *)def->build, NULL };
-    return run_command(a, i, argv, path, RP_BUILDING, p0, p1);
+    int rc = run_command(a, i, argv, path, RP_BUILDING, p0, p1);
+    if (rc < 0) {
+        /* Remember exactly which compile was interrupted, even though the
+         * checkout may already be at the newest HEAD. */
+        build_cache_set_cancelled(i);
+        state_set_status(&a->upd,
+                         "Compile of %s cancelled — will retry next time",
+                         def->name);
+        pthread_mutex_lock(&a->upd.lock);
+        snprintf(a->upd.repos[i].detail, sizeof a->upd.repos[i].detail,
+                 "%s", "Compile cancelled — retry pending");
+        pthread_mutex_unlock(&a->upd.lock);
+    } else if (rc > 0) {
+        repo_clear_build_diag(&a->upd, i);
+    }
+    return rc;
 }
 
 /* Absolute path of the running binary.  Elevated installs re-exec this same
@@ -1816,6 +2248,9 @@ run_installs(App *a, const int *idxs, const int *cloned, int count,
             finish_repo(st, i, RP_DONE, cloned[p]
                         ? "Cloned, built and installed"
                         : "Pulled, built and installed");
+            /* Keep the retry entry until the whole build/install step has
+             * succeeded, so a cancelled or failed install is retried too. */
+            build_cache_set_failed(i, 0);
         } else {
             finish_repo(st, i, RP_ERROR, use_polkit
                         ? "Install failed — Polkit denied or no agent running"
@@ -1834,6 +2269,7 @@ finish_after_build(App *a, int i, const RepoDef *def, int cloned,
     if (!def->install || !def->install[0]) {
         finish_repo(&a->upd, i, RP_DONE,
                     cloned ? "Cloned and built" : "Pulled and built");
+        build_cache_set_failed(i, 0);
         return 1;
     }
 
@@ -1897,7 +2333,11 @@ update_worker(void *arg)
             if (rc < 0)
                 goto out;
             if (rc == 0) {
-                worker_repo_error(st, i, "Build failed");
+                char detail[160];
+                repo_build_failure_detail(st, i, detail, sizeof detail);
+                build_cache_set_failed(i, 1);
+                state_show_build_failure(st, i);
+                worker_repo_error(st, i, detail);
                 continue;
             }
             if (finish_after_build(a, i, def, 1, pending, pending_cloned,
@@ -1906,40 +2346,52 @@ update_worker(void *arg)
             continue;
         }
 
+        int retry_build = build_cache_has(i);
+        int rc = 0;
+
         if (repo_dirty(path)) {
-            finish_repo(st, i, RP_CURRENT,
-                        "Local changes — fast-forward pull skipped");
-            continue;
-        }
+            if (!retry_build) {
+                finish_repo(st, i, RP_CURRENT,
+                            "Local changes — fast-forward pull skipped");
+                continue;
+            }
+            /* A failed or cancelled build must still be retried, even when
+             * local edits prevent a fast-forward pull. */
+            state_set_status(st, "Retrying build for %s…", def->name);
+        } else {
+            char before[80] = "";
+            repo_head(path, before, sizeof before);
 
-        char before[80] = "";
-        repo_head(path, before, sizeof before);
+            state_set_status(st, "Pulling %s…", def->name);
+            repo_update(st, i, RP_PULLING, 0.0, "Pulling from origin…");
+            char *pargv[] = { "git", "pull", "--ff-only", "--progress", NULL };
+            rc = run_command(a, i, pargv, path, RP_PULLING, 0.0, 0.55);
+            if (rc < 0)
+                goto out;
+            if (rc == 0) {
+                worker_repo_error(st, i, "git pull failed");
+                continue;
+            }
 
-        state_set_status(st, "Pulling %s…", def->name);
-        repo_update(st, i, RP_PULLING, 0.0, "Pulling from origin…");
-        char *pargv[] = { "git", "pull", "--ff-only", "--progress", NULL };
-        int rc = run_command(a, i, pargv, path, RP_PULLING, 0.0, 0.55);
-        if (rc < 0)
-            goto out;
-        if (rc == 0) {
-            worker_repo_error(st, i, "git pull failed");
-            continue;
-        }
+            char after[80] = "";
+            repo_head(path, after, sizeof after);
+            int changed = before[0] && after[0] && strcmp(before, after) != 0;
 
-        char after[80] = "";
-        repo_head(path, after, sizeof after);
-        int changed = before[0] && after[0] && strcmp(before, after) != 0;
-
-        if (!changed) {
-            finish_repo(st, i, RP_CURRENT, "Already up to date");
-            continue;
+            if (!changed && !retry_build) {
+                finish_repo(st, i, RP_CURRENT, "Already up to date");
+                continue;
+            }
         }
 
         rc = run_build(a, i, def, path, 0.55, 0.85);
         if (rc < 0)
             goto out;
         if (rc == 0) {
-            worker_repo_error(st, i, "Build failed");
+            char detail[160];
+            repo_build_failure_detail(st, i, detail, sizeof detail);
+            build_cache_set_failed(i, 1);
+            state_show_build_failure(st, i);
+            worker_repo_error(st, i, detail);
             continue;
         }
         if (finish_after_build(a, i, def, 0, pending, pending_cloned,
@@ -2095,6 +2547,9 @@ typedef struct {
     int hover_primary;
     int press_primary;
     int hover_repo;
+    int hover_failure_close;
+    int press_failure_close;
+    double failure_scroll;
     double done_t;
     double scroll;
     int hover_scrollbar;
@@ -2742,6 +3197,143 @@ paint_footer(cairo_t *cr, const View *v, int running)
 }
 
 static void
+failure_dialog_geom(double *x, double *y, double *w, double *h)
+{
+    double dw = WIN_W - 56.0;
+    if (dw > 620.0)
+        dw = 620.0;
+    if (dw < 280.0)
+        dw = WIN_W - 24.0;
+
+    double dh = WIN_H - 92.0;
+    if (dh > 420.0)
+        dh = 420.0;
+    if (dh < 260.0)
+        dh = 260.0;
+    if (dh > WIN_H - 32.0)
+        dh = WIN_H - 32.0;
+
+    *w = dw;
+    *h = dh;
+    *x = (WIN_W - dw) / 2.0;
+    *y = (WIN_H - dh) / 2.0;
+}
+
+static void
+failure_close_geom(double *x, double *y, double *w, double *h)
+{
+    double dx, dy, dw, dh;
+    failure_dialog_geom(&dx, &dy, &dw, &dh);
+    *w = 96.0;
+    *h = 34.0;
+    *x = dx + dw - *w - 20.0;
+    *y = dy + dh - *h - 18.0;
+}
+
+static void
+paint_failure_dialog(cairo_t *cr, const View *v)
+{
+    const UpdateSnap *s = v->s;
+    int idx = s->failure_repo;
+    if (idx < 0 || idx >= REPO_COUNT)
+        idx = -1;
+
+    double dx, dy, dw, dh;
+    failure_dialog_geom(&dx, &dy, &dw, &dh);
+
+    rgba(cr, C_BG, 0.76);
+    cairo_rectangle(cr, 0.0, 0.0, WIN_W, WIN_H);
+    cairo_fill(cr);
+
+    rgba(cr, C_BG, 0.62);
+    rounded_rect(cr, dx + 5.0, dy + 7.0, dw, dh, 14.0);
+    cairo_fill(cr);
+
+    cairo_pattern_t *bg = cairo_pattern_create_linear(dx, dy, dx, dy + dh);
+    cairo_pattern_add_color_stop_rgba(bg, 0.0,
+        R_(0x171719), G_(0x171719), B_(0x171719), 0.99);
+    cairo_pattern_add_color_stop_rgba(bg, 1.0,
+        R_(0x0B0B0C), G_(0x0B0B0C), B_(0x0B0B0C), 0.99);
+    cairo_set_source(cr, bg);
+    rounded_rect(cr, dx, dy, dw, dh, 14.0);
+    cairo_fill(cr);
+    cairo_pattern_destroy(bg);
+
+    rgba(cr, C_RED, 0.32);
+    cairo_set_line_width(cr, 1.0);
+    rounded_rect(cr, dx + 0.5, dy + 0.5, dw - 1.0, dh - 1.0, 13.5);
+    cairo_stroke(cr);
+
+    rgba(cr, C_RED, 0.78);
+    rounded_rect(cr, dx + 20.0, dy + 20.0, 3.0, 28.0, 1.5);
+    cairo_fill(cr);
+
+    char title[160];
+    if (idx >= 0)
+        snprintf(title, sizeof title, "Build failed — %s", g_repos[idx].name);
+    else
+        snprintf(title, sizeof title, "Build failed");
+    text_draw(cr, title, 17.0, 600, C_FG, 0.98,
+              dx + 32.0, dy + 21.0, ALIGN_LEFT, 0.1);
+
+    text_draw(cr, "MISSING LIBRARIES / PACKAGES", 8.8, 600, C_RED, 0.92,
+              dx + 32.0, dy + 66.0, ALIGN_LEFT, 1.5);
+
+    const RepoState *r = idx >= 0 ? &s->repos[idx] : NULL;
+    double body_x = dx + 32.0;
+    double body_w = dw - 64.0;
+    double body_y = dy + 92.0;
+    if (r && r->missing[0]) {
+        text_draw_wrapped(cr, r->missing, 12.5, 600, C_FG, 0.96,
+                          body_x, body_y, body_w, 0.1);
+    } else {
+        text_draw_wrapped(cr,
+            "No package name was found in the build output. "
+            "Check the compiler lines below.",
+            11.8, 400, C_DIM, 0.94, body_x, body_y, body_w, 0.1);
+    }
+
+    double out_y = dy + 166.0;
+    text_draw(cr, "BUILD OUTPUT", 8.8, 600, C_DIM, 0.82,
+              body_x, out_y, ALIGN_LEFT, 1.4);
+
+    cairo_save(cr);
+    cairo_rectangle(cr, body_x, out_y + 20.0, body_w,
+                    dh - (out_y - dy) - 70.0);
+    cairo_clip(cr);
+    cairo_translate(cr, 0.0, -v->failure_scroll);
+    if (r && r->build_error[0]) {
+        text_draw_wrapped(cr, r->build_error, 10.2, 400, C_DIM, 0.92,
+                          body_x, out_y + 20.0, body_w, 0.0);
+    } else {
+        text_draw(cr, "No matching compiler or linker lines were captured.",
+                  10.2, 400, C_FAINT, 0.86,
+                  body_x, out_y + 20.0, ALIGN_LEFT, 0.0);
+    }
+    cairo_restore(cr);
+
+    text_draw(cr, "Scroll output · Enter / Esc to close", 8.8, 400,
+              C_FAINT, 0.72, dx + 22.0, dy + dh - 30.0, ALIGN_LEFT, 0.35);
+
+    double bx, by, bw, bh;
+    failure_close_geom(&bx, &by, &bw, &bh);
+    int lit = v->hover_failure_close || v->press_failure_close;
+    rgba(cr, C_ACCENT, v->press_failure_close ? 0.86 :
+                       (v->hover_failure_close ? 0.97 : 1.0));
+    rounded_rect(cr, bx, by, bw, bh, bh / 2.0);
+    cairo_fill(cr);
+    if (lit) {
+        rgba(cr, C_FG, 0.22);
+        cairo_set_line_width(cr, 1.0);
+        rounded_rect(cr, bx + 0.5, by + 0.5, bw - 1.0, bh - 1.0,
+                     bh / 2.0 - 0.5);
+        cairo_stroke(cr);
+    }
+    text_draw(cr, "Close", 11.5, 600, C_ON_ACCENT, 0.98,
+              bx + bw / 2.0, by + 9.0, ALIGN_CENTER, 0.2);
+}
+
+static void
 paint_content(cairo_t *cr, const View *v)
 {
     const UpdateSnap *s = v->s;
@@ -2771,6 +3363,8 @@ paint_content(cairo_t *cr, const View *v)
     paint_progress(cr, v, running);
     paint_button(cr, v, running);
     paint_footer(cr, v, running);
+    if (s->failure_open)
+        paint_failure_dialog(cr, v);
 
     cairo_restore(cr);
 }
@@ -2786,6 +3380,57 @@ hit_primary(double x, double y)
     double bx = (WIN_W - BUTTON_W) / 2.0;
     return x >= bx && x <= bx + BUTTON_W &&
            y >= BUTTON_Y && y <= BUTTON_Y + BUTTON_H;
+}
+
+static int
+failure_dialog_open(App *a)
+{
+    pthread_mutex_lock(&a->upd.lock);
+    int open = a->upd.failure_open;
+    pthread_mutex_unlock(&a->upd.lock);
+    return open;
+}
+
+static int
+hit_failure_close(double x, double y)
+{
+    double bx, by, bw, bh;
+    failure_close_geom(&bx, &by, &bw, &bh);
+    return x >= bx && x <= bx + bw && y >= by && y <= by + bh;
+}
+
+#define FAILURE_SCROLL_MAX 320.0
+
+static void
+failure_scroll_clamp(App *a)
+{
+    if (a->failure_scroll < 0.0)
+        a->failure_scroll = 0.0;
+    if (a->failure_scroll > FAILURE_SCROLL_MAX)
+        a->failure_scroll = FAILURE_SCROLL_MAX;
+}
+
+static void
+close_failure_dialog(App *a)
+{
+    int closed = 0;
+    pthread_mutex_lock(&a->upd.lock);
+    /* Only close the dialog the UI actually saw.  If a second build failed
+     * while the user was clicking, leave that newer dialog open. */
+    if (a->upd.failure_open &&
+        a->upd.failure_seq == a->failure_view_seq) {
+        a->upd.failure_open = 0;
+        a->upd.failure_repo = -1;
+        closed = 1;
+    }
+    pthread_mutex_unlock(&a->upd.lock);
+    if (closed)
+        a->failure_view_seq = 0;
+    a->failure_scroll = 0.0;
+    a->hover_failure_close = 0;
+    a->press_failure_close = 0;
+    a->press_primary = 0;
+    a->dirty = 1;
 }
 
 static int
@@ -2815,6 +3460,29 @@ repo_at(App *a, double x, double y)
             return i;
     }
     return -1;
+}
+
+static void
+update_hovers(App *a)
+{
+    double x = a->pointer_x;
+    double y = a->pointer_y;
+
+    if (failure_dialog_open(a)) {
+        a->hover_failure_close = hit_failure_close(x, y);
+        a->hover_primary = 0;
+        a->press_primary = 0;
+        a->hover_repo = -1;
+        a->hover_scrollbar = 0;
+        a->drag_scrollbar = 0;
+        return;
+    }
+
+    a->hover_failure_close = 0;
+    a->press_failure_close = 0;
+    a->hover_primary = hit_primary(x, y);
+    a->hover_scrollbar = scrollbar_at(x, y);
+    a->hover_repo = a->hover_scrollbar ? -1 : repo_at(a, x, y);
 }
 
 static int
@@ -2889,7 +3557,10 @@ update_cursor(App *a)
     }
 
     uint32_t shape = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_DEFAULT;
-    if (a->hover_primary) {
+    if (failure_dialog_open(a)) {
+        if (a->hover_failure_close)
+            shape = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_POINTER;
+    } else if (a->hover_primary) {
         shape = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_POINTER;
     } else if (a->drag_scrollbar) {
         shape = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_GRABBING;
@@ -3115,6 +3786,9 @@ app_draw(App *a, const UpdateSnap *s)
     v.hover_primary = a->hover_primary;
     v.press_primary = a->press_primary;
     v.hover_repo = a->hover_repo;
+    v.hover_failure_close = a->hover_failure_close;
+    v.press_failure_close = a->press_failure_close;
+    v.failure_scroll = a->failure_scroll;
     v.done_t = a->done_t;
     v.scroll = a->list_scroll;
     v.hover_scrollbar = a->hover_scrollbar;
@@ -3356,10 +4030,7 @@ pointer_enter(void *data, struct wl_pointer *pointer, uint32_t serial,
     a->pointer_x = wl_fixed_to_double(sx);
     a->pointer_y = wl_fixed_to_double(sy);
     a->cursor_shape = 0;
-    a->hover_primary = hit_primary(a->pointer_x, a->pointer_y);
-    a->hover_scrollbar = scrollbar_at(a->pointer_x, a->pointer_y);
-    a->hover_repo = a->hover_scrollbar
-                    ? -1 : repo_at(a, a->pointer_x, a->pointer_y);
+    update_hovers(a);
     a->dirty = 1;
     update_cursor(a);
 }
@@ -3375,7 +4046,9 @@ pointer_leave(void *data, struct wl_pointer *pointer, uint32_t serial,
     a->hover_primary = 0;
     a->hover_repo = -1;
     a->hover_scrollbar = 0;
+    a->hover_failure_close = 0;
     a->press_primary = 0;
+    a->press_failure_close = 0;
     a->drag_scrollbar = 0;
     a->dirty = 1;
     update_cursor(a);
@@ -3389,6 +4062,13 @@ pointer_motion(void *data, struct wl_pointer *pointer, uint32_t time,
     App *a = data;
     a->pointer_x = wl_fixed_to_double(sx);
     a->pointer_y = wl_fixed_to_double(sy);
+
+    if (failure_dialog_open(a)) {
+        update_hovers(a);
+        a->dirty = 1;
+        update_cursor(a);
+        return;
+    }
 
     if (a->drag_scrollbar) {
         list_clamp_scroll(a);
@@ -3404,10 +4084,7 @@ pointer_motion(void *data, struct wl_pointer *pointer, uint32_t time,
         return;
     }
 
-    a->hover_primary = hit_primary(a->pointer_x, a->pointer_y);
-    a->hover_scrollbar = scrollbar_at(a->pointer_x, a->pointer_y);
-    a->hover_repo = a->hover_scrollbar
-                    ? -1 : repo_at(a, a->pointer_x, a->pointer_y);
+    update_hovers(a);
     a->dirty = 1;
     update_cursor(a);
 }
@@ -3424,11 +4101,16 @@ pointer_button(void *data, struct wl_pointer *pointer, uint32_t serial,
 
     double x = a->pointer_x;
     double y = a->pointer_y;
-    a->hover_primary = hit_primary(x, y);
-    a->hover_scrollbar = scrollbar_at(x, y);
-    a->hover_repo = a->hover_scrollbar ? -1 : repo_at(a, x, y);
+    update_hovers(a);
 
     if (state == WL_POINTER_BUTTON_STATE_PRESSED) {
+        if (failure_dialog_open(a)) {
+            if (a->hover_failure_close)
+                a->press_failure_close = 1;
+            a->dirty = 1;
+            update_cursor(a);
+            return;
+        }
         if (a->hover_scrollbar) {
             list_clamp_scroll(a);
             double th = scrollbar_thumb_h();
@@ -3448,6 +4130,14 @@ pointer_button(void *data, struct wl_pointer *pointer, uint32_t serial,
                 xdg_toplevel_move(a->toplevel, a->seat, serial);
         }
     } else {
+        if (failure_dialog_open(a)) {
+            if (a->press_failure_close && a->hover_failure_close)
+                close_failure_dialog(a);
+            a->press_failure_close = 0;
+            a->dirty = 1;
+            update_cursor(a);
+            return;
+        }
         if (a->drag_scrollbar) {
             a->drag_scrollbar = 0;
             list_clamp_scroll(a);
@@ -3471,8 +4161,13 @@ pointer_axis(void *data, struct wl_pointer *pointer, uint32_t time,
     App *a = data;
     if (a->axis_discrete_seen)
         return;
-    a->list_scroll += wl_fixed_to_double(value) * 4.0;
-    list_clamp_scroll(a);
+    if (failure_dialog_open(a)) {
+        a->failure_scroll += wl_fixed_to_double(value) * 4.0;
+        failure_scroll_clamp(a);
+    } else {
+        a->list_scroll += wl_fixed_to_double(value) * 4.0;
+        list_clamp_scroll(a);
+    }
     a->dirty = 1;
 }
 
@@ -3505,9 +4200,14 @@ pointer_axis_discrete(void *data, struct wl_pointer *pointer, uint32_t axis,
     if (axis != WL_POINTER_AXIS_VERTICAL_SCROLL || discrete == 0)
         return;
     App *a = data;
-    a->list_scroll += (double)discrete * 28.0;
+    if (failure_dialog_open(a)) {
+        a->failure_scroll += (double)discrete * 28.0;
+        failure_scroll_clamp(a);
+    } else {
+        a->list_scroll += (double)discrete * 28.0;
+        list_clamp_scroll(a);
+    }
     a->axis_discrete_seen = 1;
-    list_clamp_scroll(a);
     a->dirty = 1;
 }
 
@@ -3585,6 +4285,17 @@ keyboard_key(void *data, struct wl_keyboard *keyboard, uint32_t serial,
 
     a->dirty = 1;
     xkb_keysym_t sym = xkb_state_key_get_one_sym(a->xkb_state, key + 8);
+
+    if (failure_dialog_open(a)) {
+        if (sym == XKB_KEY_Escape || sym == XKB_KEY_q ||
+            sym == XKB_KEY_Return || sym == XKB_KEY_KP_Enter ||
+            sym == XKB_KEY_space) {
+            close_failure_dialog(a);
+            update_cursor(a);
+        }
+        return;
+    }
+
     if (sym == XKB_KEY_Escape || sym == XKB_KEY_q) {
         a->quit = 1;
     } else if (sym == XKB_KEY_space || sym == XKB_KEY_Return ||
@@ -4294,6 +5005,7 @@ main(int argc, char **argv)
     state_load(&a);
 
     repo_paths_init(base_dir);
+    build_cache_load();
     state_init(&a.upd);
 
     const char *scale_env = getenv("JTUPDATE_SCALE");
@@ -4342,6 +5054,13 @@ main(int argc, char **argv)
         UpdateSnap s;
         memset(&s, 0, sizeof s);
         state_snapshot(&a.upd, &s);
+
+        /* Record which failure dialog the UI has rendered, so a close cannot
+         * accidentally dismiss a newer failure shown by the worker. */
+        if (s.failure_open && s.failure_seq != a.failure_view_seq) {
+            a.failure_view_seq = s.failure_seq;
+            a.failure_scroll = 0.0;
+        }
 
         if (memcmp(&s, &prev_snap, sizeof s) != 0) {
             prev_snap = s;

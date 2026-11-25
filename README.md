@@ -33,7 +33,11 @@ static const RepoDef g_repos[REPO_COUNT] = {
     { "jtnetworks",  "jtnetworks",  "https://github.com/arch-user-sudo/jtnetworks.git",  "make -j2", "make install" },
     { "jtlabwc",     "jtlabwc",     "https://github.com/arch-user-sudo/jtlabwc.git",     "make -j2", "make install" },
     { "jtupdate",    "jtupdater",   "https://github.com/arch-user-sudo/jtupdater.git",   "make -j2", "make install" },
-    { "jtlX",        "jtlX",        "https://github.com/arch-user-sudo/jtlX.git",        "make -j2", "make install" },
+    { "jtsettings",  "jtsettings",  "https://github.com/arch-user-sudo/jtsettings.git",  "make -j2", "make install" },
+    { "jtwpi",       "jtwpi",       "https://github.com/arch-user-sudo/jtwpi.git",       "make -j2", "make install" },
+    { "jtpolkit",    "jtpolkit",    "https://github.com/arch-user-sudo/jtpolkit.git",    "make -j2", "make install" },
+    { "jtgreeter",   "jtgreeter",   "https://github.com/arch-user-sudo/jtgreeter.git",   "make -j2", "make install" },
+    { "jtfiles",     "jtfiles",     "https://github.com/arch-user-sudo/jtfiles.git",     "make -j2", "make install" },
 };
 ```
 
@@ -76,10 +80,21 @@ above. When `jtupdate` is run from its source tree, the `jtupdater` install
 uses that source tree instead of the cached clone, so a freshly built updater
 never replaces itself with an older checkout.
 
+## Failed and cancelled builds
+
+A build failure opens an in-app window listing the missing packages, headers,
+or linker libraries found in the compiler output. Failed projects are also
+recorded in `$HOME/.cache/jt/jtupdate`, one slug per line. A compile that is
+cancelled is recorded in the same file as `<slug>\tcancelled`, so the project
+whose build was interrupted is remembered too. Both kinds are retried on the
+next update even when HEAD has not changed. Once a project builds and installs
+successfully, its line is removed; the cache file is deleted when no pending
+builds remain.
+
 ## Controls
 
 - `Space` / `Enter` — check for updates, or stop while running
-- `Esc` / `q` — quit
+- `Esc` / `q` — quit, or close the build-failure window when it is open
 - Drag the header to move the window
 - Scroll over the repository list, drag the scrollbar, or click its track to
   page through repositories
