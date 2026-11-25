@@ -170,6 +170,17 @@ scrollbar_thumb_y(double scroll)
 
 #define FONT_FAMILY "Liberation"
 
+/* Shared type scale.  The main UI and the build-failure dialog use the same
+ * sizes for equivalent roles, so the dialog reads as part of the same app. */
+#define FS_HERO     24.0
+#define FS_HEADING  15.0
+#define FS_ROW      14.5
+#define FS_BUTTON   13.5
+#define FS_SUB      10.8
+#define FS_BODY     9.8
+#define FS_SECTION  9.0
+#define FS_META     8.8
+
 #define C_BG        0x030303
 #define C_BG_TOP    0x090A0B
 #define C_FG        0xFFFFFF
@@ -2761,9 +2772,9 @@ paint_header(cairo_t *cr, const View *v)
         cairo_fill(cr);
     }
 
-    double w1 = text_draw(cr, "JTLab", 15.0, 700, C_FG, 0.96,
+    double w1 = text_draw(cr, "JTLab", FS_HEADING, 700, C_FG, 0.96,
                           49.0, 19.0, ALIGN_LEFT, 0.1);
-    text_draw(cr, "Updater", 15.0, 400, C_DIM, 0.86,
+    text_draw(cr, "Updater", FS_HEADING, 400, C_DIM, 0.86,
               49.0 + w1 + 5.0, 19.0, ALIGN_LEFT, 0.1);
     text_draw(cr, "repositories · git · build · install", 9.0, 400, C_FAINT, 0.75,
               49.0, 39.0, ALIGN_LEFT, 0.55);
@@ -2793,9 +2804,9 @@ paint_hero(cairo_t *cr, const View *v, int running)
         title = "Update stopped";
 
     double tx = 164.0;
-    text_draw(cr, "REPOSITORY UPDATER", 9.0, 600, C_ACCENT, 0.90,
+    text_draw(cr, "REPOSITORY UPDATER", FS_SECTION, 600, C_ACCENT, 0.90,
               tx, 90.0, ALIGN_LEFT, 2.2);
-    text_draw(cr, title, 24.0, 700, C_FG, 0.97,
+    text_draw(cr, title, FS_HERO, 700, C_FG, 0.97,
               tx, 106.0, ALIGN_LEFT, 0.0);
 
     char sub[256];
@@ -2820,13 +2831,13 @@ paint_hero(cairo_t *cr, const View *v, int running)
                  "changed repositories are built and installed.",
                  g_repo_root_show);
     }
-    text_draw_wrapped(cr, sub, 10.8, 400, C_DIM, 0.94,
+    text_draw_wrapped(cr, sub, FS_SUB, 400, C_DIM, 0.94,
                       tx, 145.0, 548.0, 0.12);
 
     char meta[128];
     snprintf(meta, sizeof meta, "%d REPOS   ·   %d UPDATED   ·   %d ISSUES",
              REPO_COUNT, s->updated_count, s->error_count);
-    text_draw(cr, meta, 8.8, 600, C_FAINT, 0.90,
+    text_draw(cr, meta, FS_META, 600, C_FAINT, 0.90,
               tx, 182.0, ALIGN_LEFT, 1.15);
 }
 
@@ -2933,7 +2944,7 @@ paint_repo_row(cairo_t *cr, const View *v, int i)
 
     paint_repo_icon(cr, v, i, x + 22.0, y + ROW_H / 2.0);
 
-    text_draw(cr, g_repos[i].name, 14.5, 600, C_FG, 0.97,
+    text_draw(cr, g_repos[i].name, FS_ROW, 600, C_FG, 0.97,
               x + 40.0, y + 12.0, ALIGN_LEFT, 0.1);
 
     unsigned dcol = C_MUTED;
@@ -2952,7 +2963,7 @@ paint_repo_row(cairo_t *cr, const View *v, int i)
     cairo_save(cr);
     cairo_rectangle(cr, x + 40.0, y + 31.0, w - 150.0, 19.0);
     cairo_clip(cr);
-    text_draw(cr, r->detail, 9.8, 400, dcol, da,
+    text_draw(cr, r->detail, FS_BODY, 400, dcol, da,
               x + 40.0, y + 32.0, ALIGN_LEFT, 0.12);
     cairo_restore(cr);
 
@@ -2995,11 +3006,11 @@ paint_repo_row(cairo_t *cr, const View *v, int i)
 static void
 paint_repo_list(cairo_t *cr, const View *v)
 {
-    text_draw(cr, "REPOSITORIES", 9.0, 600, C_DIM, 0.82,
+    text_draw(cr, "REPOSITORIES", FS_SECTION, 600, C_DIM, 0.82,
               MARGIN, LIST_LABEL_Y, ALIGN_LEFT, 2.0);
     char right[64];
     snprintf(right, sizeof right, "%d REPOS", REPO_COUNT);
-    text_draw(cr, right, 8.8, 600, C_FAINT, 0.78,
+    text_draw(cr, right, FS_META, 600, C_FAINT, 0.78,
               WIN_W - MARGIN, LIST_LABEL_Y, ALIGN_RIGHT, 1.2);
 
     cairo_save(cr);
@@ -3060,7 +3071,7 @@ paint_progress(cairo_t *cr, const View *v, int running)
     char pct[32];
     snprintf(pct, sizeof pct, "%d%%", (int)lround(p * 100.0));
 
-    text_draw(cr, "OVERALL PROGRESS", 8.8, 600,
+    text_draw(cr, "OVERALL PROGRESS", FS_META, 600,
               running ? C_ACCENT : C_DIM, running ? 0.90 : 0.78,
               x + 16.0, y + 11.0, ALIGN_LEFT, 1.7);
     text_draw(cr, pct, 11.0, 700, col, 0.96,
@@ -3099,7 +3110,7 @@ paint_progress(cairo_t *cr, const View *v, int running)
     cairo_save(cr);
     cairo_rectangle(cr, x + 16.0, y + 47.0, w - 32.0, 18.0);
     cairo_clip(cr);
-    text_draw(cr, s->status, 9.8, 400, C_DIM, 0.92,
+    text_draw(cr, s->status, FS_BODY, 400, C_DIM, 0.92,
               x + 16.0, y + 47.0, ALIGN_LEFT, 0.12);
     cairo_restore(cr);
 }
@@ -3177,7 +3188,7 @@ paint_button(cairo_t *cr, const View *v, int running)
         cairo_stroke(cr);
     }
 
-    text_draw(cr, label, 13.5, 600, ink, 1.0,
+    text_draw(cr, label, FS_BUTTON, 600, ink, 1.0,
               gx + iconw + gap, cy - 9.4, ALIGN_LEFT, 0.25);
 }
 
@@ -3273,28 +3284,35 @@ paint_failure_dialog(cairo_t *cr, const View *v)
         snprintf(title, sizeof title, "Build failed — %s", g_repos[idx].name);
     else
         snprintf(title, sizeof title, "Build failed");
-    text_draw(cr, title, 17.0, 600, C_FG, 0.98,
+    text_draw(cr, title, FS_HEADING, 700, C_FG, 0.98,
               dx + 32.0, dy + 21.0, ALIGN_LEFT, 0.1);
 
-    text_draw(cr, "MISSING LIBRARIES / PACKAGES", 8.8, 600, C_RED, 0.92,
+    text_draw(cr, "MISSING LIBRARIES / PACKAGES", FS_SECTION, 600, C_RED, 0.92,
               dx + 32.0, dy + 66.0, ALIGN_LEFT, 1.5);
 
     const RepoState *r = idx >= 0 ? &s->repos[idx] : NULL;
     double body_x = dx + 32.0;
     double body_w = dw - 64.0;
     double body_y = dy + 92.0;
+    double out_y = dy + 166.0;
+    /* Clip the dependency list to its own area so a long list cannot run
+     * into the build-output section below. */
+    cairo_save(cr);
+    cairo_rectangle(cr, body_x, body_y - 2.0, body_w,
+                    out_y - body_y - 8.0);
+    cairo_clip(cr);
     if (r && r->missing[0]) {
-        text_draw_wrapped(cr, r->missing, 12.5, 600, C_FG, 0.96,
+        text_draw_wrapped(cr, r->missing, FS_ROW, 600, C_FG, 0.96,
                           body_x, body_y, body_w, 0.1);
     } else {
         text_draw_wrapped(cr,
             "No package name was found in the build output. "
             "Check the compiler lines below.",
-            11.8, 400, C_DIM, 0.94, body_x, body_y, body_w, 0.1);
+            FS_SUB, 400, C_DIM, 0.94, body_x, body_y, body_w, 0.1);
     }
+    cairo_restore(cr);
 
-    double out_y = dy + 166.0;
-    text_draw(cr, "BUILD OUTPUT", 8.8, 600, C_DIM, 0.82,
+    text_draw(cr, "BUILD OUTPUT", FS_SECTION, 600, C_DIM, 0.82,
               body_x, out_y, ALIGN_LEFT, 1.4);
 
     cairo_save(cr);
@@ -3303,16 +3321,16 @@ paint_failure_dialog(cairo_t *cr, const View *v)
     cairo_clip(cr);
     cairo_translate(cr, 0.0, -v->failure_scroll);
     if (r && r->build_error[0]) {
-        text_draw_wrapped(cr, r->build_error, 10.2, 400, C_DIM, 0.92,
+        text_draw_wrapped(cr, r->build_error, FS_BODY, 400, C_DIM, 0.92,
                           body_x, out_y + 20.0, body_w, 0.0);
     } else {
         text_draw(cr, "No matching compiler or linker lines were captured.",
-                  10.2, 400, C_FAINT, 0.86,
+                  FS_BODY, 400, C_FAINT, 0.86,
                   body_x, out_y + 20.0, ALIGN_LEFT, 0.0);
     }
     cairo_restore(cr);
 
-    text_draw(cr, "Scroll output · Enter / Esc to close", 8.8, 400,
+    text_draw(cr, "Scroll output · Enter / Esc to close", FS_META, 400,
               C_FAINT, 0.72, dx + 22.0, dy + dh - 30.0, ALIGN_LEFT, 0.35);
 
     double bx, by, bw, bh;
@@ -3329,7 +3347,7 @@ paint_failure_dialog(cairo_t *cr, const View *v)
                      bh / 2.0 - 0.5);
         cairo_stroke(cr);
     }
-    text_draw(cr, "Close", 11.5, 600, C_ON_ACCENT, 0.98,
+    text_draw(cr, "Close", FS_BUTTON, 600, C_ON_ACCENT, 0.98,
               bx + bw / 2.0, by + 9.0, ALIGN_CENTER, 0.2);
 }
 
