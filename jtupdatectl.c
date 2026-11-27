@@ -3,6 +3,8 @@
  * Usage:
  *   jtupdatectl accent '#RRGGBB'   change the accent live
  *   jtupdatectl '#RRGGBB'          shorthand for the same
+ *   jtupdatectl rainbow [on|off|toggle]
+ *                                  cycle accent colours (toggle if omitted)
  *   jtupdatectl update             start checking for updates
  *   jtupdatectl stop               stop the current update
  *   jtupdatectl quit               exit the window
@@ -62,9 +64,10 @@ static void
 usage(const char *prog)
 {
     fprintf(stderr,
-            "usage: %s accent '#RRGGBB'|update|stop|quit\n"
+            "usage: %s accent '#RRGGBB'|rainbow [on|off|toggle]|update|stop|quit\n"
             "       %s '#RRGGBB'\n"
             "  accent COLOR   change the window accent while it is running\n"
+            "  rainbow        cycle accent colours (toggle; on|off|toggle explicit)\n"
             "  update         start checking for updates\n"
             "  stop           stop the current update\n"
             "  quit           exit the window\n",
@@ -93,6 +96,22 @@ main(int argc, char *argv[])
         snprintf(msg, sizeof(msg), "accent #%06X\n", rgb);
     } else if (argc == 2 && parse_color(argv[1], &rgb)) {
         snprintf(msg, sizeof(msg), "accent #%06X\n", rgb);
+    } else if (!strcmp(argv[1], "rainbow")) {
+        if (argc > 3) {
+            usage(argv[0]);
+            return 1;
+        }
+        if (argc == 3) {
+            if (strcmp(argv[2], "on") && strcmp(argv[2], "off") &&
+                strcmp(argv[2], "toggle")) {
+                fprintf(stderr,
+                        "%s: rainbow expects on, off, or toggle\n", argv[0]);
+                return 2;
+            }
+            snprintf(msg, sizeof(msg), "rainbow %s\n", argv[2]);
+        } else {
+            snprintf(msg, sizeof(msg), "rainbow\n");
+        }
     } else if (!strcmp(argv[1], "update")) {
         if (argc != 2) {
             usage(argv[0]);

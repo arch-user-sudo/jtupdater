@@ -6,7 +6,9 @@
  *   make
  *   ./jtupdate
  *   ./jtupdate '#748382'                 (optional accent override)
+ *   ./jtupdate rainbow                   (cycle accent colours; or --rainbow)
  *   ./jtupdatectl accent '#748382'       (change accent while running)
+ *   ./jtupdatectl rainbow [on|off|toggle] (cycle accent colours)
  *   ./jtupdatectl update                 (start an update)
  *
  * The repositories are cloned into <base-dir>/<slug>, which defaults to
@@ -195,9 +197,14 @@ scrollbar_thumb_y(double scroll)
 #define C_RED       0xD06B6B
 
 /* The accent is shared by every accent surface.  It can be changed at launch
- * or live through jtupdatectl. */
+ * or live through jtupdatectl.  Rainbow mode cycles it; the base colour is
+ * restored when rainbow mode is switched off so an explicit accent is never
+ * lost. */
 static unsigned accent_rgb = 0xE8A03C;
 static unsigned on_accent_rgb = 0x14100A;
+static unsigned accent_base_rgb = 0xE8A03C;
+static int rainbow_mode = 0;
+static double rainbow_start = 0.0;
 #define C_ACCENT    accent_rgb
 #define C_ON_ACCENT on_accent_rgb
 
@@ -317,11 +324,73 @@ accent_ink(unsigned rgb)
     return light_contrast > dark_contrast ? light : dark;
 }
 
+/* One full hue wheel every eight seconds, rendered as a saturated RGB
+ * triple.  t is seconds since rainbow mode was switched on. */
+static unsigned
+rainbow_color(double t)
+{
+    double phase = fmod(t, 8.0);
+    if (phase < 0.0)
+        phase += 8.0;
+    double h = phase * 0.75;
+    int i = (int)h;
+    double f = h - i;
+    double q = 1.0 - f;
+    double r = 0.0, g = 0.0, b = 0.0;
+    switch (i) {
+    case 0: r = 1.0; g = f;   b = 0.0; break;
+    case 1: r = q;   g = 1.0; b = 0.0; break;
+    case 2: r = 0.0; g = 1.0; b = f;   break;
+    case 3: r = 0.0; g = q;   b = 1.0; break;
+    case 4: r = f;   g = 0.0; b = 1.0; break;
+    default:r = 1.0; g = 0.0; b = q;   break;
+    }
+    return ((unsigned)lround(r * 255.0) << 16) |
+           ((unsigned)lround(g * 255.0) << 8) |
+           (unsigned)lround(b * 255.0);
+}
+
 static void
-accent_set(unsigned rgb)
+accent_apply(unsigned rgb)
 {
     accent_rgb = rgb;
     on_accent_rgb = accent_ink(rgb);
+}
+
+static void
+accent_set(unsigned rgb)
+{
+    accent_base_rgb = rgb;
+    rainbow_mode = 0;   /* an explicit colour takes over */
+    accent_apply(rgb);
+}
+
+static void
+rainbow_set(int on, double now)
+{
+    int was_on = rainbow_mode;
+    rainbow_mode = on ? 1 : 0;
+    if (rainbow_mode) {
+        if (!was_on) {
+            rainbow_start = now;
+            accent_apply(rainbow_color(0.0));
+        }
+    } else if (was_on) {
+        accent_apply(accent_base_rgb);
+    }
+}
+
+/* Returns 1 only when the quantized hue changed. */
+static int
+accent_tick(double now)
+{
+    if (!rainbow_mode)
+        return 0;
+    unsigned rgb = rainbow_color(now - rainbow_start);
+    if (rgb == accent_rgb)
+        return 0;
+    accent_apply(rgb);
+    return 1;
 }
 
 static int
@@ -330,6 +399,15 @@ accent_cli(int *argc, char **argv)
     for (int i = 1; i < *argc; i++) {
         const char *value = NULL;
         int consumed = 0;
+
+        if (!strcmp(argv[i], "--rainbow") || !strcmp(argv[i], "rainbow")) {
+            rainbow_set(1, mono_sec());
+            for (int j = i; j + 1 < *argc; j++)
+                argv[j] = argv[j + 1];
+            (*argc)--;
+            i--;
+            continue;
+        }
 
         if (!strcmp(argv[i], "--accent")) {
             if (i + 1 >= *argc) {
@@ -3748,6 +3826,10 @@ frame_done(void *data, struct wl_callback *cb, uint32_t time)
     if (fabs(a->disp_target - a->disp) < 0.001)
         a->disp = a->disp_target;
 
+    /* Rainbow mode advances on the frame clock; ambient_glow_ensure() picks
+     * up the new accent when the next frame is painted. */
+    accent_tick(now);
+
     /* Ambient motion runs continuously; keep requesting frames. */
     a->dirty = 1;
 }
@@ -4576,6 +4658,25 @@ ctl_handle_line(App *a, char *line)
         return;
     }
 
+    if (!strncmp(line, "rainbow", 7) &&
+        (line[7] == '\0' || line[7] == ' ' || line[7] == '\t')) {
+        const char *arg = line + 7;
+        while (*arg == ' ' || *arg == '\t')
+            arg++;
+        int on;
+        if (!*arg || !strcmp(arg, "toggle"))
+            on = !rainbow_mode;
+        else if (!strcmp(arg, "on"))
+            on = 1;
+        else if (!strcmp(arg, "off"))
+            on = 0;
+        else
+            return;
+        rainbow_set(on, mono_sec());
+        a->dirty = 1;
+        return;
+    }
+
     if (strncmp(line, "accent", 6) == 0 &&
         (line[6] == ' ' || line[6] == '\t')) {
         const char *arg = line + 6;
@@ -4987,9 +5088,11 @@ main(int argc, char **argv)
     repo_paths_init(base_dir);
 
     if (argc >= 2 && (!strcmp(argv[1], "-h") || !strcmp(argv[1], "--help"))) {
-        printf("usage: %s [ACCENT] [--base-dir DIR] [--screenshot PATH]\n\n"
+        printf("usage: %s [ACCENT] [rainbow] [--base-dir DIR] "
+               "[--screenshot PATH]\n\n"
                "  ACCENT              #RRGGBB or RRGGBB, for example '#378484'\n"
                "  --accent COLOR      explicit form of ACCENT\n"
+               "  rainbow             cycle accent colours (or --rainbow)\n"
                "  --base-dir DIR      directory that holds the checkouts\n"
                "                      (default: ~/jtupdate/repos)\n"
                "  --screenshot PATH   render a demo frame to PATH and exit\n\n"
@@ -4997,6 +5100,7 @@ main(int argc, char **argv)
                "Add their URLs to the g_repos table at the top of jtupdate.c.\n\n"
                "controls: Space/Enter check or stop, Esc/q quit\n"
                "live accent: jtupdatectl accent '#RRGGBB'\n"
+               "live rainbow: jtupdatectl rainbow [on|off|toggle]\n"
                "requires a Wayland compositor supporting xdg-shell\n",
                argv[0], g_repo_root_show);
         return 0;
